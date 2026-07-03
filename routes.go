@@ -27,7 +27,9 @@ func (r *Replicator) registerRoutes(se *core.ServeEvent) {
 	g.GET("/status", r.handleStatus).Bind(apis.RequireSuperuserAuth())
 	g.GET("/firewall/summary", r.handleFirewallSummary).Bind(apis.RequireSuperuserAuth())
 	g.GET("/clients", r.handleClients).Bind(apis.RequireSuperuserAuth())
+	g.GET("/clients/detail", r.handleClientDetail).Bind(apis.RequireSuperuserAuth())
 	g.GET("/world.json", r.handleWorldMap).Bind(apis.RequireSuperuserAuth())
+	g.GET("/countries.json", r.handleCountries).Bind(apis.RequireSuperuserAuth())
 	g.GET("/dashboard", r.handleDashboard) // HTML shell; its data calls require superuser auth
 }
 

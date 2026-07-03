@@ -105,6 +105,7 @@ docker compose up --build
 | `GeoIPDBPath` | `""` | Path to a MaxMind-format `.mmdb` enabling country/region firewall rules. |
 | `FirewallExemptSuperusers` | `true` | Superuser-authenticated requests bypass app-scope firewall rules (lock-out guard). |
 | `DisableIPGeolocation` | `false` | Turn off the automatic one-time geolocation of client IPs via ip-api.com (dashboard map). |
+| `IPAPIKey` | `""` | Optional ip-api.com paid ("pro") API key. When set, geolocation uses the HTTPS pro endpoint with a higher rate limit. |
 
 The example app maps `PBR_NODE_URL`, `PBR_SEED_URL`,
 `PBR_CLUSTER_SECRET` and `PBR_GEOIP_DB` env vars to these fields.
@@ -141,13 +142,22 @@ login from the browser automatically). Two tabs:
 - **Map**: a world map of every unique client IP this node has seen —
   blue dots for allowed clients, red for clients with blocked requests,
   countries under an active deny rule shaded red, and blocked regions
-  listed. Each new public IP is geolocated **once** via the free
-  [ip-api.com](https://ip-api.com) endpoint (well under its 45 req/min
-  limit) and cached forever; private/loopback addresses are counted but
-  not located. If you don't want any outbound geolocation calls, set
-  `DisableIPGeolocation: true`. Client IPs are tracked per node, kept
-  for `TombstoneRetention` (capped at 10k IPs), and correct client
-  addresses behind a proxy require PocketBase's trusted-proxy settings.
+  listed. Below the map, a searchable **client IP list**: click any IP
+  to see its full ip-api.com record and its top request paths with
+  per-path request/blocked counts — handy for spotting automated or
+  suspicious traffic. Each new public IP is geolocated **once** via
+  [ip-api.com](https://ip-api.com) and cached forever; private/loopback
+  addresses are counted but not located. The free endpoint is used by
+  default (rate-limited under its 45 req/min cap); set `IPAPIKey` to use
+  the paid HTTPS pro endpoint. Set `DisableIPGeolocation: true` to make
+  no outbound geolocation calls at all. Client IPs and paths are tracked
+  per node, kept for `TombstoneRetention` (capped at 10k IPs and 200
+  paths per IP), and correct client addresses behind a proxy require
+  PocketBase's trusted-proxy settings.
+
+Firewall country/region rules are picked from a multi-select in the
+dashboard (search by name; one rule is created per selection), and the
+IP/CIDR inputs show format-specific placeholders.
 
 Data endpoints (`/api/replication/status`,
 `/api/replication/firewall/summary`) require superuser auth.

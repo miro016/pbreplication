@@ -195,30 +195,32 @@ func (fw *firewall) bindMiddleware(se *core.ServeEvent) {
 func (fw *firewall) middleware(e *core.RequestEvent) error {
 	ipStr := e.RealIP()
 	ip := net.ParseIP(ipStr)
+	method := e.Request.Method
+	path := e.Request.URL.Path
 
 	// never lock out loopback
 	if ip != nil && ip.IsLoopback() {
-		fw.r.trackClient(ipStr, false)
+		fw.r.trackClient(ipStr, method, path, false)
 		return e.Next()
 	}
 
 	scope := fwScopeApp
-	if strings.HasPrefix(e.Request.URL.Path, "/api/replication/") {
+	if strings.HasPrefix(path, "/api/replication/") {
 		scope = fwScopeReplication
 	}
 
 	// lock-out guard: authenticated superusers bypass app-scope rules
 	if scope == fwScopeApp && *fw.r.cfg.FirewallExemptSuperusers && e.HasSuperuserAuth() {
-		fw.r.trackClient(ipStr, false)
+		fw.r.trackClient(ipStr, method, path, false)
 		return e.Next()
 	}
 
 	if fw.allowed(scope, ip) {
-		fw.r.trackClient(ipStr, false)
+		fw.r.trackClient(ipStr, method, path, false)
 		return e.Next()
 	}
 
-	fw.r.trackClient(ipStr, true)
+	fw.r.trackClient(ipStr, method, path, true)
 	fw.r.stats.blocked.Add(1)
 	return e.Error(http.StatusForbidden, "Access denied by firewall rules.", nil)
 }

@@ -33,11 +33,19 @@ const (
 	geoLookupInterval = 2 * time.Second // ~30 req/min, under ip-api's 45/min
 	clientFlushBatch  = 512
 	maxTrackedClients = 10000
+	maxPathsPerFlush  = 4096
+	maxPathLen        = 256
+	maxPathsPerIP     = 200 // keep the top paths per IP after GC
 )
 
 type clientCounter struct {
 	requests atomic.Int64
 	blocked  atomic.Int64
+}
+
+type pathCounter struct {
+	count   atomic.Int64
+	blocked atomic.Int64
 }
 
 type clientRow struct {
@@ -54,9 +62,10 @@ type clientRow struct {
 	GeoStatus string  `db:"geo_status" json:"geo_status"`
 }
 
-// trackClient counts a request from an IP; called from the firewall
-// middleware on every request, so it must stay cheap (two atomic adds).
-func (r *Replicator) trackClient(ip string, blocked bool) {
+// trackClient counts a request from an IP (and its method+path); called
+// from the firewall middleware on every request, so it must stay cheap
+// (a couple of atomic adds + a map lookup).
+func (r *Replicator) trackClient(ip, method, path string, blocked bool) {
 	if ip == "" {
 		return
 	}
@@ -65,6 +74,20 @@ func (r *Replicator) trackClient(ip string, blocked bool) {
 	c.requests.Add(1)
 	if blocked {
 		c.blocked.Add(1)
+	}
+
+	if path == "" {
+		return
+	}
+	if len(path) > maxPathLen {
+		path = path[:maxPathLen]
+	}
+	key := ip + "\x00" + method + "\x00" + path
+	pv, _ := r.pathCounts.LoadOrStore(key, &pathCounter{})
+	pc := pv.(*pathCounter)
+	pc.count.Add(1)
+	if blocked {
+		pc.blocked.Add(1)
 	}
 }
 
@@ -110,6 +133,65 @@ func (r *Replicator) flushClients() {
 		flushed++
 		return flushed < clientFlushBatch
 	})
+
+	r.flushClientPaths(db, now)
+}
+
+// flushClientPaths writes buffered per-(ip,method,path) counters.
+func (r *Replicator) flushClientPaths(db dbx.Builder, now string) {
+	flushed := 0
+	r.pathCounts.Range(func(key, v any) bool {
+		pc := v.(*pathCounter)
+		cnt := pc.count.Swap(0)
+		blk := pc.blocked.Swap(0)
+		if cnt == 0 && blk == 0 {
+			r.pathCounts.Delete(key)
+			return true
+		}
+		parts := splitPathKey(key.(string))
+		if parts == nil {
+			r.pathCounts.Delete(key)
+			return true
+		}
+		_, err := db.NewQuery(`INSERT INTO _repl_client_paths
+			(ip, method, path, count, blocked, last_seen)
+			VALUES ({:ip}, {:m}, {:p}, {:c}, {:b}, {:now})
+			ON CONFLICT(ip, method, path) DO UPDATE SET
+				count = count + {:c}, blocked = blocked + {:b}, last_seen = {:now}`).
+			Bind(dbx.Params{"ip": parts[0], "m": parts[1], "p": parts[2], "c": cnt, "b": blk, "now": now}).Execute()
+		if err != nil {
+			pc.count.Add(cnt)
+			pc.blocked.Add(blk)
+			return true
+		}
+		flushed++
+		return flushed < maxPathsPerFlush
+	})
+}
+
+func splitPathKey(key string) []string {
+	first := -1
+	for i := 0; i < len(key); i++ {
+		if key[i] == 0 {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return nil
+	}
+	rest := key[first+1:]
+	second := -1
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == 0 {
+			second = i
+			break
+		}
+	}
+	if second < 0 {
+		return nil
+	}
+	return []string{key[:first], rest[:second], rest[second+1:]}
 }
 
 // ---------------------------------------------------------------------
@@ -126,8 +208,15 @@ type geoResult struct {
 }
 
 func (r *Replicator) lookupGeoIPAPI(ip string) (*geoResult, error) {
-	req, err := http.NewRequest(http.MethodGet,
-		"http://ip-api.com/json/"+url.PathEscape(ip)+"?fields=status,countryCode,region,city,lat,lon", nil)
+	// paid key -> HTTPS pro endpoint (higher limits); otherwise the free
+	// endpoint (rate-limited by the geoLoop ticker)
+	fields := "status,countryCode,region,city,lat,lon"
+	endpoint := "http://ip-api.com/json/" + url.PathEscape(ip) + "?fields=" + fields
+	if r.cfg.IPAPIKey != "" {
+		endpoint = "https://pro.ip-api.com/json/" + url.PathEscape(ip) +
+			"?fields=" + fields + "&key=" + url.QueryEscape(r.cfg.IPAPIKey)
+	}
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +248,15 @@ func (r *Replicator) geoLoop() {
 		r.geoLookup = r.lookupGeoIPAPI
 	}
 
-	ticker := time.NewTicker(geoLookupInterval)
+	interval := geoLookupInterval
+	perTick := 1
+	if r.cfg.IPAPIKey != "" {
+		// paid key: drain the pending queue quickly
+		interval = time.Second
+		perTick = 20
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -167,7 +264,11 @@ func (r *Replicator) geoLoop() {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
-			r.geoStep()
+			for i := 0; i < perTick; i++ {
+				if !r.geoStep() {
+					break
+				}
+			}
 		}
 	}
 }
@@ -215,8 +316,20 @@ func gcClients(db dbx.Builder, retention time.Duration) error {
 		Bind(dbx.Params{"cut": cutoff}).Execute(); err != nil {
 		return err
 	}
-	_, err := db.NewQuery(fmt.Sprintf(`DELETE FROM _repl_client_ips WHERE ip NOT IN (
-		SELECT ip FROM _repl_client_ips ORDER BY last_seen DESC LIMIT %d)`, maxTrackedClients)).Execute()
+	if _, err := db.NewQuery(fmt.Sprintf(`DELETE FROM _repl_client_ips WHERE ip NOT IN (
+		SELECT ip FROM _repl_client_ips ORDER BY last_seen DESC LIMIT %d)`, maxTrackedClients)).Execute(); err != nil {
+		return err
+	}
+
+	// drop paths for IPs no longer tracked, then cap paths per IP
+	if _, err := db.NewQuery(`DELETE FROM _repl_client_paths
+		WHERE ip NOT IN (SELECT ip FROM _repl_client_ips)`).Execute(); err != nil {
+		return err
+	}
+	_, err := db.NewQuery(fmt.Sprintf(`DELETE FROM _repl_client_paths WHERE rowid NOT IN (
+		SELECT rowid FROM _repl_client_paths p
+		WHERE (SELECT COUNT(*) FROM _repl_client_paths q
+			WHERE q.ip = p.ip AND q.count > p.count) < %d)`, maxPathsPerIP)).Execute()
 	return err
 }
 
@@ -270,4 +383,51 @@ func (r *Replicator) handleWorldMap(e *core.RequestEvent) error {
 	}
 	e.Response.Header().Set("Cache-Control", "max-age=86400")
 	return e.Blob(http.StatusOK, "application/json", data)
+}
+
+func (r *Replicator) handleCountries(e *core.RequestEvent) error {
+	data, err := dashboardFS.ReadFile("dashboard/countries.json")
+	if err != nil {
+		return e.NotFoundError("countries asset missing", nil)
+	}
+	e.Response.Header().Set("Cache-Control", "max-age=86400")
+	return e.Blob(http.StatusOK, "application/json", data)
+}
+
+type clientPathRow struct {
+	Method   string `db:"method" json:"method"`
+	Path     string `db:"path" json:"path"`
+	Count    int64  `db:"count" json:"count"`
+	Blocked  int64  `db:"blocked" json:"blocked"`
+	LastSeen string `db:"last_seen" json:"last_seen"`
+}
+
+type clientDetailResponse struct {
+	Client *clientRow       `json:"client"`
+	Paths  []*clientPathRow `json:"paths"`
+}
+
+// handleClientDetail returns one client's geo record plus its top
+// request paths, so an operator can spot automated/suspicious traffic.
+func (r *Replicator) handleClientDetail(e *core.RequestEvent) error {
+	ip := e.Request.URL.Query().Get("ip")
+	if ip == "" {
+		return e.BadRequestError("missing ip", nil)
+	}
+
+	// flush in-memory buffers first so counts are current
+	r.flushClients()
+
+	var row clientRow
+	if err := r.app.DB().NewQuery(`SELECT * FROM _repl_client_ips WHERE ip = {:ip}`).
+		Bind(dbx.Params{"ip": ip}).One(&row); err != nil {
+		return e.NotFoundError("unknown client", nil)
+	}
+
+	var paths []*clientPathRow
+	_ = r.app.DB().NewQuery(fmt.Sprintf(`SELECT method, path, count, blocked, last_seen
+		FROM _repl_client_paths WHERE ip = {:ip} ORDER BY count DESC LIMIT %d`, maxPathsPerIP)).
+		Bind(dbx.Params{"ip": ip}).All(&paths)
+
+	return e.JSON(http.StatusOK, &clientDetailResponse{Client: &row, Paths: paths})
 }

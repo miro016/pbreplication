@@ -101,6 +101,11 @@ type Config struct {
 	// client IPs via ip-api.com (used by the dashboard map). Client IPs
 	// are still counted; they just won't be located. Default: false.
 	DisableIPGeolocation bool
+
+	// IPAPIKey is an optional ip-api.com paid ("pro") API key. When set,
+	// geolocation uses the HTTPS pro endpoint (higher rate limit, no
+	// public-network throttling). When empty the free endpoint is used.
+	IPAPIKey string
 }
 
 func (c *Config) setDefaults() {
@@ -179,6 +184,8 @@ type Replicator struct {
 
 	// buffered per-client-IP request counters (flushed in batches)
 	clientCounts sync.Map // ip -> *clientCounter
+	// buffered per-(ip,method,path) counters
+	pathCounts sync.Map // "ip\x00method\x00path" -> *pathCounter
 	// geolocation resolver, overridable in tests
 	geoLookup func(ip string) (*geoResult, error)
 

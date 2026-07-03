@@ -159,6 +159,16 @@ func createTables(app core.App) error {
 			geo_status TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS _repl_client_ips_seen_idx ON _repl_client_ips (last_seen)`,
+		`CREATE TABLE IF NOT EXISTS _repl_client_paths (
+			ip        TEXT NOT NULL,
+			method    TEXT NOT NULL DEFAULT '',
+			path      TEXT NOT NULL,
+			count     INTEGER NOT NULL DEFAULT 0,
+			blocked   INTEGER NOT NULL DEFAULT 0,
+			last_seen TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (ip, method, path)
+		)`,
+		`CREATE INDEX IF NOT EXISTS _repl_client_paths_ip_idx ON _repl_client_paths (ip)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := app.NonconcurrentDB().NewQuery(stmt).Execute(); err != nil {

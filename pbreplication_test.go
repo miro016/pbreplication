@@ -543,10 +543,10 @@ func TestClientTrackingAndGeoCache(t *testing.T) {
 	app, r := newTestNode(t, "nodeA0000000001")
 
 	// buffered counting -> batched flush
-	r.trackClient("127.0.0.1", false)
-	r.trackClient("127.0.0.1", false)
-	r.trackClient("8.8.8.8", false)
-	r.trackClient("8.8.8.8", true)
+	r.trackClient("127.0.0.1", "GET", "/", false)
+	r.trackClient("127.0.0.1", "GET", "/", false)
+	r.trackClient("8.8.8.8", "GET", "/api/collections/users/records", false)
+	r.trackClient("8.8.8.8", "POST", "/api/admins/auth", true)
 	r.flushClients()
 
 	var loop clientRow
@@ -566,11 +566,30 @@ func TestClientTrackingAndGeoCache(t *testing.T) {
 	}
 
 	// counters accumulate across flushes
-	r.trackClient("8.8.8.8", true)
+	r.trackClient("8.8.8.8", "POST", "/api/admins/auth", true)
 	r.flushClients()
 	_ = app.DB().NewQuery(`SELECT * FROM _repl_client_ips WHERE ip = '8.8.8.8'`).One(&pub)
 	if pub.Requests != 3 || pub.Blocked != 2 {
 		t.Fatalf("counters did not accumulate: %+v", pub)
+	}
+
+	// per-path tracking
+	var paths []*clientPathRow
+	if err := app.DB().NewQuery(`SELECT method, path, count, blocked, last_seen
+		FROM _repl_client_paths WHERE ip = '8.8.8.8' ORDER BY count DESC`).All(&paths); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 tracked paths, got %d", len(paths))
+	}
+	var authPath *clientPathRow
+	for _, p := range paths {
+		if p.Path == "/api/admins/auth" {
+			authPath = p
+		}
+	}
+	if authPath == nil || authPath.Method != "POST" || authPath.Count != 2 || authPath.Blocked != 2 {
+		t.Fatalf("bad auth path row: %+v", authPath)
 	}
 
 	// geolocation: exactly one lookup per IP, result cached

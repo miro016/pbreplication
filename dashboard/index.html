@@ -64,11 +64,21 @@
     <form class="addrule" onsubmit="return addRule(event)">
       <select id="ruAction"><option>deny</option><option>allow</option></select>
       <select id="ruScope"><option>app</option><option>replication</option></select>
-      <select id="ruMatch"><option>ip</option><option>cidr</option><option>country</option><option>region</option></select>
-      <input id="ruValue" placeholder="203.0.113.7 / 10.0.0.0/8 / US / US-CA" required style="min-width:220px">
+      <select id="ruMatch" onchange="onMatchChange()">
+        <option>ip</option><option>cidr</option><option>country</option><option>region</option>
+      </select>
+      <input id="ruValue" placeholder="203.0.113.7" required style="min-width:220px">
+      <select id="ruCountry" multiple size="1" style="display:none; min-width:240px; height:34px"></select>
+      <div id="ruRegionWrap" style="display:none">
+        <input id="ruRegion" list="regionList" placeholder="US-CA (comma-separated for several)" style="min-width:240px">
+        <datalist id="regionList"></datalist>
+      </div>
       <input id="ruNote" placeholder="note (optional)">
       <button class="primary">Add rule</button>
     </form>
+    <div class="hint" id="ruMultiHint" style="margin:-8px 0 12px; display:none">
+      Tip: hold Ctrl/Cmd to pick several — one rule is created per selection.
+    </div>
     <table>
       <thead><tr><th>Action</th><th>Scope</th><th>Match</th><th>Value</th><th>Note</th><th>Active</th><th></th></tr></thead>
       <tbody id="ruleRows"><tr><td colspan="7">Loading…</td></tr></tbody>
@@ -89,6 +99,25 @@
            font-size:12px; padding:5px 9px; border-radius:6px; white-space:nowrap; z-index:5"></div>
     </div>
     <div id="blockedGeo" class="hint" style="margin-top:12px"></div>
+
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; align-items:start">
+      <div>
+        <h2 style="margin-top:0">Client IPs</h2>
+        <input id="ipFilter" placeholder="filter by IP, country, city…" oninput="renderClientList()"
+               style="width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:6px; font:inherit; margin-bottom:8px">
+        <div style="max-height:420px; overflow:auto; border:1px solid var(--line); border-radius:8px">
+          <table>
+            <thead><tr><th>IP</th><th>Location</th><th>Req</th><th>Blocked</th></tr></thead>
+            <tbody id="ipRows"><tr><td colspan="4">Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <h2 style="margin-top:0">Details</h2>
+        <div id="ipDetail" class="card">Select an IP to see its ip-api data and request paths.</div>
+      </div>
+    </div>
+
     <div class="err" id="mapErr"></div>
   </section>
 </main>
@@ -183,6 +212,51 @@ async function refreshStatus() {
   }
 }
 
+let countryNames = null; // {US: "United States", ...}
+
+async function loadCountries() {
+  if (countryNames) return countryNames;
+  try { countryNames = await api('/api/replication/countries.json'); }
+  catch (_) { countryNames = {}; }
+  const sel = document.getElementById('ruCountry');
+  sel.innerHTML = Object.keys(countryNames).sort((a, b) =>
+    countryNames[a].localeCompare(countryNames[b])).map(iso =>
+    '<option value="' + iso + '">' + esc(iso + ' — ' + countryNames[iso]) + '</option>').join('');
+  return countryNames;
+}
+
+function onMatchChange() {
+  const mt = document.getElementById('ruMatch').value;
+  const val = document.getElementById('ruValue');
+  const country = document.getElementById('ruCountry');
+  const regionWrap = document.getElementById('ruRegionWrap');
+  const multiHint = document.getElementById('ruMultiHint');
+
+  val.style.display = (mt === 'ip' || mt === 'cidr') ? '' : 'none';
+  val.required = (mt === 'ip' || mt === 'cidr');
+  country.style.display = mt === 'country' ? '' : 'none';
+  country.size = mt === 'country' ? 6 : 1;
+  country.style.height = mt === 'country' ? '' : '34px';
+  regionWrap.style.display = mt === 'region' ? '' : 'none';
+  multiHint.style.display = mt === 'country' ? '' : 'none';
+
+  if (mt === 'ip') val.placeholder = '203.0.113.7';
+  else if (mt === 'cidr') val.placeholder = '10.0.0.0/8';
+  if (mt === 'country') loadCountries();
+  if (mt === 'region') populateRegionList();
+}
+
+// fill the region datalist from regions observed in the client table
+async function populateRegionList() {
+  const dl = document.getElementById('regionList');
+  if (dl.children.length > 0) return;
+  try {
+    const data = await api('/api/replication/clients');
+    const regions = [...new Set((data.clients || []).map(c => c.region).filter(Boolean))].sort();
+    dl.innerHTML = regions.map(r => '<option value="' + esc(r) + '">').join('');
+  } catch (_) {}
+}
+
 async function refreshFirewall() {
   try {
     const [sum, rules] = await Promise.all([
@@ -210,16 +284,37 @@ async function refreshFirewall() {
 
 async function addRule(ev) {
   ev.preventDefault();
+  const action = document.getElementById('ruAction').value;
+  const scope = document.getElementById('ruScope').value;
+  const mt = document.getElementById('ruMatch').value;
+  const note = document.getElementById('ruNote').value;
+
+  // collect one or more values depending on the match type
+  let values = [];
+  if (mt === 'country') {
+    values = Array.from(document.getElementById('ruCountry').selectedOptions).map(o => o.value);
+  } else if (mt === 'region') {
+    values = document.getElementById('ruRegion').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  } else {
+    const v = document.getElementById('ruValue').value.trim();
+    if (v) values = [v];
+  }
+  if (!values.length) {
+    document.getElementById('fwErr').textContent = 'Please provide at least one value.';
+    return false;
+  }
+
   try {
-    await api(RULES, {method: 'POST', body: JSON.stringify({
-      action: document.getElementById('ruAction').value,
-      scope: document.getElementById('ruScope').value,
-      match_type: document.getElementById('ruMatch').value,
-      value: document.getElementById('ruValue').value.trim(),
-      note: document.getElementById('ruNote').value,
-      active: true
-    })});
-    document.getElementById('ruValue').value = ''; document.getElementById('ruNote').value = '';
+    // one rule per value (multiselect convenience)
+    for (const value of values) {
+      await api(RULES, {method: 'POST', body: JSON.stringify({
+        action, scope, match_type: mt, value, note, active: true
+      })});
+    }
+    document.getElementById('ruValue').value = '';
+    document.getElementById('ruRegion').value = '';
+    document.getElementById('ruNote').value = '';
+    Array.from(document.getElementById('ruCountry').options).forEach(o => o.selected = false);
     refreshFirewall();
   } catch (err) { document.getElementById('fwErr').textContent = 'Add failed: ' + err.message; }
   return false;
@@ -238,6 +333,8 @@ async function deleteRule(id) {
 
 let worldData = null;   // {"US": [ring, ...], ...} ring = [[lon,lat],...]
 let mapDots = [];       // screen-space dots for hover hit-testing
+let allClients = [];    // last fetched client list
+let selectedIP = '';
 
 function project(lon, lat, w, h) {
   return [(lon + 180) / 360 * w, (90 - lat) / 180 * h];
@@ -248,6 +345,7 @@ async function refreshMap() {
     if (!worldData) worldData = await api('/api/replication/world.json');
     const data = await api('/api/replication/clients');
     const clients = data.clients || [];
+    allClients = clients;
     const located = clients.filter(c => c.geo_status === 'ok');
     const blockedIPs = clients.filter(c => c.blocked > 0);
 
@@ -257,17 +355,75 @@ async function refreshMap() {
       card('blocked IPs', blockedIPs.length) +
       card('geolocation', data.geo_enabled ? 'on' : 'off');
 
-    const blockedCountries = data.blocked_countries || [];
-    const blockedRegions = data.blocked_regions || [];
+    const blockedCountries = [...new Set(data.blocked_countries || [])];
+    const blockedRegions = [...new Set(data.blocked_regions || [])];
     document.getElementById('blockedGeo').innerHTML =
       (blockedCountries.length ? '<b>Blocked countries:</b> ' + blockedCountries.map(esc).join(', ') + '<br>' : '') +
       (blockedRegions.length ? '<b>Blocked regions:</b> ' + blockedRegions.map(esc).join(', ') : '') ||
       'No country/region deny rules active.';
 
+    // populate the region datalist from observed client regions
+    const regions = [...new Set(clients.map(c => c.region).filter(Boolean))].sort();
+    document.getElementById('regionList').innerHTML = regions.map(r => '<option value="' + esc(r) + '">').join('');
+
     drawMap(located, new Set(blockedCountries.map(c => c.toUpperCase())));
+    renderClientList();
     document.getElementById('mapErr').textContent = '';
   } catch (err) {
     document.getElementById('mapErr').textContent = 'Map request failed: ' + err.message;
+  }
+}
+
+function renderClientList() {
+  const q = (document.getElementById('ipFilter').value || '').toLowerCase();
+  const rows = allClients
+    .filter(c => !q || (c.ip + ' ' + c.country + ' ' + c.region + ' ' + c.city).toLowerCase().includes(q))
+    .sort((a, b) => b.requests - a.requests)
+    .map(c =>
+      '<tr style="cursor:pointer' + (c.ip === selectedIP ? ';background:rgba(79,110,247,.10)' : '') +
+        '" onclick="showClientDetail(\'' + esc(c.ip) + '\')">' +
+      '<td class="mono">' + (c.blocked > 0 ? '<span style="color:var(--bad)">●</span> ' : '') + esc(c.ip) + '</td>' +
+      '<td>' + esc([c.city, c.region || c.country].filter(Boolean).join(', ') || (c.geo_status === 'private' ? 'private' : '—')) + '</td>' +
+      '<td class="mono">' + c.requests + '</td>' +
+      '<td class="mono">' + (c.blocked > 0 ? '<b style="color:var(--bad)">' + c.blocked + '</b>' : '0') + '</td></tr>'
+    ).join('');
+  document.getElementById('ipRows').innerHTML = rows || '<tr><td colspan="4">No clients recorded yet.</td></tr>';
+}
+
+async function showClientDetail(ip) {
+  selectedIP = ip;
+  renderClientList();
+  const box = document.getElementById('ipDetail');
+  box.textContent = 'Loading…';
+  try {
+    const d = await api('/api/replication/clients/detail?ip=' + encodeURIComponent(ip));
+    const c = d.client || {};
+    const paths = d.paths || [];
+    const geoRows = [
+      ['IP', c.ip], ['Country', c.country], ['Region', c.region], ['City', c.city],
+      ['Coordinates', c.lat || c.lon ? (c.lat + ', ' + c.lon) : ''],
+      ['Geo status', c.geo_status],
+      ['Total requests', c.requests], ['Blocked', c.blocked],
+      ['First seen', c.first_seen], ['Last seen', c.last_seen],
+    ].filter(r => r[1] !== '' && r[1] != null)
+     .map(r => '<tr><td style="color:var(--muted);padding:2px 10px 2px 0">' + esc(r[0]) +
+        '</td><td class="mono">' + esc(r[1]) + '</td></tr>').join('');
+
+    const pathRows = paths.map(p =>
+      '<tr><td class="mono">' + esc(p.method) + '</td>' +
+      '<td class="mono" style="word-break:break-all">' + esc(p.path) + '</td>' +
+      '<td class="mono">' + p.count + '</td>' +
+      '<td class="mono">' + (p.blocked > 0 ? '<b style="color:var(--bad)">' + p.blocked + '</b>' : '0') + '</td></tr>'
+    ).join('') || '<tr><td colspan="4">No paths recorded.</td></tr>';
+
+    box.innerHTML =
+      '<table style="width:100%;border:none;background:none">' + geoRows + '</table>' +
+      '<h2 style="font-size:13px;margin:14px 0 8px">Top request paths</h2>' +
+      '<div style="max-height:260px;overflow:auto"><table style="width:100%">' +
+      '<thead><tr><th>Method</th><th>Path</th><th>Count</th><th>Blocked</th></tr></thead>' +
+      '<tbody>' + pathRows + '</tbody></table></div>';
+  } catch (err) {
+    box.textContent = 'Failed to load details: ' + err.message;
   }
 }
 
