@@ -309,6 +309,22 @@ The suite covers the HLC, LWW gating, capture→apply round-trips
 idempotence, HMAC auth, compaction/garbage collection and the firewall
 matcher. The `example/` compose file doubles as an end-to-end test bed.
 
+## Releases & versioning
+
+Versioning is automated with
+[release-please](https://github.com/googleapis/release-please). Commits to
+`main` use [Conventional Commits](https://www.conventionalcommits.org)
+(`feat:`, `fix:`, `docs:`, `chore:`, …). release-please keeps an open
+"release PR" that bumps the version and updates `CHANGELOG.md`; merging it
+tags `vX.Y.Z` and publishes a GitHub release. Downstream projects then:
+
+```bash
+go get github.com/miro016/pbreplication@vX.Y.Z
+```
+
+No manual tagging or registry upload is needed — Go fetches modules
+straight from the tagged git commit.
+
 ## License
 
 MIT
