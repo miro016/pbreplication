@@ -1,0 +1,35 @@
+name: release-please
+
+# Automatic versioning & releases.
+#
+# On every push to main, release-please inspects the Conventional Commit
+# messages since the last release and maintains an open "release PR" that
+# bumps the version and updates CHANGELOG.md. Merging that PR creates the
+# git tag (vX.Y.Z) and a GitHub release. Because this is a Go module,
+# that tag is all downstream projects need:
+#
+#     go get github.com/miro016/pbreplication@vX.Y.Z
+#
+# Commit message conventions that drive the version bump:
+#   fix:   ...   -> patch (v0.1.0 -> v0.1.1)
+#   feat:  ...   -> minor (v0.1.0 -> v0.2.0)
+#   feat!: ...   -> major once >= v1 (pre-1.0, "!" bumps the minor)
+#   docs:/chore:/refactor:/test:/ci: -> no release on their own
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
