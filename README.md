@@ -98,7 +98,7 @@ docker compose up --build
 | `CompactionInterval` | `1h` | How often the oplog/bookkeeping garbage collection runs. |
 | `ExcludeCollections` | `_mfas, _otps, _authOrigins` | Collections that stay node-local. |
 | `ReplicateSuperusers` | `true` | Replicate the `_superusers` collection. |
-| `EnableUIExtension` | `false` | Experimental: inject a dashboard link into the admin UI. |
+| `DisableUIExtension` | `false` | Turn off the "Replication" tab injected into the admin UI. |
 | `GeoIPDBPath` | `""` | Path to a MaxMind-format `.mmdb` enabling country/region firewall rules. |
 | `FirewallExemptSuperusers` | `true` | Superuser-authenticated requests bypass app-scope firewall rules (lock-out guard). |
 
@@ -119,16 +119,23 @@ The example app maps `PBR_NODE_URL`, `PBR_SEED_URL`,
 
 ## Dashboard
 
-`GET /api/replication/dashboard` on any node — a standalone page with
-two tabs:
+The easiest way in: log into the admin UI (`/_/`) — a **Replication**
+tab appears in the sidebar and opens the dashboard right inside the
+admin UI, authenticated with your existing login (no extra token). This
+tab uses PocketBase's experimental UI-extension API; if a future PB
+version changes the admin internals it degrades to a simple link, and
+you can turn it off with `DisableUIExtension: true`.
+
+The dashboard is also available standalone at
+`GET /api/replication/dashboard` on any node (it picks up your admin UI
+login from the browser automatically). Two tabs:
 
 - **Nodes**: every member, its URL (or pull-only), health, replication
   progress, oplog size, pending/failed operations.
 - **Firewall**: manage allow/deny rules, see per-scope mode
   (blacklist/whitelist), GeoIP status and the blocked-request counter.
 
-The page reuses your admin UI login (superuser token from
-localStorage); data endpoints (`/api/replication/status`,
+Data endpoints (`/api/replication/status`,
 `/api/replication/firewall/summary`) require superuser auth.
 
 ## Firewall
@@ -205,8 +212,10 @@ compaction horizon are automatically resynced from a full snapshot.
   of the others and let them re-bootstrap from it (fresh `SeedURL`).
 - **Settings** (SMTP, app name, …) are not replicated — configure per
   node (they're usually env-driven anyway).
-- `EnableUIExtension` uses PocketBase's experimental UI extension API
-  and may break on PB upgrades; the standalone dashboard always works.
+- The admin-UI "Replication" tab uses PocketBase's experimental UI
+  extension API and may break on PB upgrades (it degrades to a plain
+  link); the standalone dashboard always works. Opt out with
+  `DisableUIExtension: true`.
 - **Security**: the cluster secret grants full read/write to the whole
   database. Use long random secrets, HTTPS or a private network between
   nodes, and consider a `replication`-scope firewall whitelist.

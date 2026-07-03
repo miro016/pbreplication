@@ -104,9 +104,11 @@ func (r *Replicator) handleDashboard(e *core.RequestEvent) error {
 }
 
 // registerUIExtension hooks into PocketBase's experimental superuser UI
-// extension API to surface a link to the dashboard inside the admin UI.
-// May break on PocketBase upgrades; the standalone dashboard page is
-// the stable interface.
+// extension API to add a "Replication" tab to the admin UI sidebar
+// (opening the dashboard in an overlay, authenticated with the SPA's
+// live superuser token). May break on PocketBase upgrades - the script
+// degrades to a floating link, and the standalone dashboard page is the
+// stable interface either way.
 func (r *Replicator) registerUIExtension(se *core.ServeEvent) {
 	sub, err := fs.Sub(dashboardFS, "dashboard")
 	if err != nil {

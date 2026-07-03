@@ -82,10 +82,11 @@ type Config struct {
 	// collection. Default: true.
 	ReplicateSuperusers *bool
 
-	// EnableUIExtension injects a link into the PocketBase admin UI
-	// using PocketBase's experimental UI extension API. The standalone
-	// dashboard at /api/replication/dashboard always works. Default: false.
-	EnableUIExtension bool
+	// DisableUIExtension turns off the "Replication" tab that is
+	// injected into the PocketBase admin UI via PocketBase's
+	// experimental UI extension API. The standalone dashboard at
+	// /api/replication/dashboard always works. Default: false (enabled).
+	DisableUIExtension bool
 
 	// GeoIPDBPath optionally points to a MaxMind-format .mmdb database
 	// used to resolve country/region firewall rules.
@@ -225,7 +226,7 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
 		r.registerRoutes(se)
 		r.firewall.bindMiddleware(se)
-		if cfg.EnableUIExtension {
+		if !cfg.DisableUIExtension {
 			r.registerUIExtension(se)
 		}
 		r.startBackground()

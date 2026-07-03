@@ -79,17 +79,44 @@
 <script>
 const RULES = '/api/collections/pbr_firewall_rules/records';
 let token = '';
+let parentToken = ''; // pushed via postMessage when embedded in the admin UI
+
+// The admin UI embeds this page in an iframe and posts the live
+// superuser token, so it never has to be re-entered.
+window.addEventListener('message', ev => {
+  if (ev.origin === location.origin && ev.data && typeof ev.data.pbrToken === 'string') {
+    parentToken = ev.data.pbrToken;
+    token = '';
+    refreshStatus();
+  }
+});
+if (window.parent !== window) {
+  try { window.parent.postMessage({pbrTokenRequest: true}, location.origin); } catch (_) {}
+  // leave room for the host overlay's close button
+  document.addEventListener('DOMContentLoaded', () => {
+    document.querySelector('header').style.paddingRight = '60px';
+  });
+}
 
 function loadToken() {
+  if (parentToken) return parentToken;
+  // The admin SPA stores its auth under "__pb_superusers__" + the admin
+  // page's pathname (e.g. "__pb_superusers__/_"), so scan by prefix.
   try {
-    const raw = localStorage.getItem('__pb_superusers__');
-    if (raw) { const parsed = JSON.parse(raw); if (parsed && parsed.token) return parsed.token; }
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || key.indexOf('__pb_superusers__') !== 0) continue;
+      try {
+        const parsed = JSON.parse(localStorage.getItem(key));
+        if (parsed && parsed.token) return parsed.token;
+      } catch (_) {}
+    }
   } catch (_) {}
   return sessionStorage.getItem('pbr_token') || '';
 }
 function ensureToken() {
   if (!token) token = loadToken();
-  if (!token) {
+  if (!token && window.parent === window) {
     token = prompt('Superuser auth token (log into the PocketBase admin UI on this host to skip this):') || '';
     if (token) sessionStorage.setItem('pbr_token', token);
   }
