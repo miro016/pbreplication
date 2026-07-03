@@ -43,6 +43,7 @@
   <nav>
     <button id="tabNodes" class="active" onclick="showTab('nodes')">Nodes</button>
     <button id="tabFirewall" onclick="showTab('firewall')">Firewall</button>
+    <button id="tabMap" onclick="showTab('map')">Map</button>
   </nav>
 </header>
 <main>
@@ -73,6 +74,22 @@
       <tbody id="ruleRows"><tr><td colspan="7">Loading…</td></tr></tbody>
     </table>
     <div class="err" id="fwErr"></div>
+  </section>
+
+  <section id="map" style="display:none">
+    <div class="cards" id="mapCards"></div>
+    <div class="hint">Every unique client IP seen by this node, geolocated once via ip-api.com and cached.
+      <span style="color:var(--accent)">●</span> allowed clients,
+      <span style="color:var(--bad)">●</span> clients with blocked requests.
+      Countries with an active <b>deny</b> rule are shaded red; blocked regions are listed below.
+      Private/loopback addresses are counted but cannot be placed on the map.</div>
+    <div class="card" style="padding:8px; position:relative">
+      <canvas id="worldCanvas" style="width:100%; display:block"></canvas>
+      <div id="mapTip" style="position:absolute; display:none; pointer-events:none; background:#1c2430; color:#fff;
+           font-size:12px; padding:5px 9px; border-radius:6px; white-space:nowrap; z-index:5"></div>
+    </div>
+    <div id="blockedGeo" class="hint" style="margin-top:12px"></div>
+    <div class="err" id="mapErr"></div>
   </section>
 </main>
 
@@ -217,17 +234,120 @@ async function deleteRule(id) {
   catch (err) { document.getElementById('fwErr').textContent = 'Delete failed: ' + err.message; }
 }
 
+// ------------------------------------------------------------------ map
+
+let worldData = null;   // {"US": [ring, ...], ...} ring = [[lon,lat],...]
+let mapDots = [];       // screen-space dots for hover hit-testing
+
+function project(lon, lat, w, h) {
+  return [(lon + 180) / 360 * w, (90 - lat) / 180 * h];
+}
+
+async function refreshMap() {
+  try {
+    if (!worldData) worldData = await api('/api/replication/world.json');
+    const data = await api('/api/replication/clients');
+    const clients = data.clients || [];
+    const located = clients.filter(c => c.geo_status === 'ok');
+    const blockedIPs = clients.filter(c => c.blocked > 0);
+
+    document.getElementById('mapCards').innerHTML =
+      card('unique clients', clients.length) +
+      card('geolocated', located.length) +
+      card('blocked IPs', blockedIPs.length) +
+      card('geolocation', data.geo_enabled ? 'on' : 'off');
+
+    const blockedCountries = data.blocked_countries || [];
+    const blockedRegions = data.blocked_regions || [];
+    document.getElementById('blockedGeo').innerHTML =
+      (blockedCountries.length ? '<b>Blocked countries:</b> ' + blockedCountries.map(esc).join(', ') + '<br>' : '') +
+      (blockedRegions.length ? '<b>Blocked regions:</b> ' + blockedRegions.map(esc).join(', ') : '') ||
+      'No country/region deny rules active.';
+
+    drawMap(located, new Set(blockedCountries.map(c => c.toUpperCase())));
+    document.getElementById('mapErr').textContent = '';
+  } catch (err) {
+    document.getElementById('mapErr').textContent = 'Map request failed: ' + err.message;
+  }
+}
+
+function drawMap(located, blockedCountries) {
+  const canvas = document.getElementById('worldCanvas');
+  const cssW = canvas.parentElement.clientWidth - 16;
+  const scale = window.devicePixelRatio || 1;
+  const w = cssW, h = Math.round(cssW / 2);
+  canvas.style.height = h + 'px';
+  canvas.width = w * scale; canvas.height = h * scale;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+
+  ctx.fillStyle = '#f0f4f8';
+  ctx.fillRect(0, 0, w, h);
+
+  for (const iso2 in worldData) {
+    const blocked = blockedCountries.has(iso2);
+    ctx.fillStyle = blocked ? 'rgba(214,69,69,.38)' : '#dde3e9';
+    ctx.strokeStyle = blocked ? 'rgba(214,69,69,.8)' : '#c3cad2';
+    ctx.lineWidth = 0.5;
+    for (const ring of worldData[iso2]) {
+      ctx.beginPath();
+      for (let i = 0; i < ring.length; i++) {
+        const [x, y] = project(ring[i][0], ring[i][1], w, h);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+  }
+
+  mapDots = [];
+  for (const c of located) {
+    const [x, y] = project(c.lon, c.lat, w, h);
+    const bad = c.blocked > 0;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = bad ? '#d64545' : '#4f6ef7';
+    ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = '#fff'; ctx.stroke();
+    mapDots.push({x, y, c});
+  }
+}
+
+document.getElementById('worldCanvas').addEventListener('mousemove', ev => {
+  const rect = ev.target.getBoundingClientRect();
+  const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+  let best = null, bestD = 100;
+  for (const d of mapDots) {
+    const dist = (d.x - mx) ** 2 + (d.y - my) ** 2;
+    if (dist < bestD) { best = d; bestD = dist; }
+  }
+  const tip = document.getElementById('mapTip');
+  if (!best) { tip.style.display = 'none'; return; }
+  const c = best.c;
+  tip.innerHTML = esc(c.ip) + ' · ' + esc([c.city, c.region || c.country].filter(Boolean).join(', ')) +
+    '<br>' + c.requests + ' requests' + (c.blocked > 0 ? ' · <b>' + c.blocked + ' blocked</b>' : '');
+  tip.style.left = (best.x + 14) + 'px';
+  tip.style.top = (best.y - 6) + 'px';
+  tip.style.display = 'block';
+});
+document.getElementById('worldCanvas').addEventListener('mouseleave', () => {
+  document.getElementById('mapTip').style.display = 'none';
+});
+
 function showTab(name) {
-  document.getElementById('nodes').style.display = name === 'nodes' ? '' : 'none';
-  document.getElementById('firewall').style.display = name === 'firewall' ? '' : 'none';
-  document.getElementById('tabNodes').classList.toggle('active', name === 'nodes');
-  document.getElementById('tabFirewall').classList.toggle('active', name === 'firewall');
+  for (const t of ['nodes', 'firewall', 'map']) {
+    document.getElementById(t).style.display = name === t ? '' : 'none';
+    document.getElementById('tab' + t[0].toUpperCase() + t.slice(1)).classList.toggle('active', name === t);
+  }
   if (name === 'firewall') refreshFirewall();
+  if (name === 'map') refreshMap();
 }
 
 refreshStatus();
 setInterval(refreshStatus, 5000);
-setInterval(() => { if (document.getElementById('firewall').style.display !== 'none') refreshFirewall(); }, 5000);
+setInterval(() => {
+  if (document.getElementById('firewall').style.display !== 'none') refreshFirewall();
+  if (document.getElementById('map').style.display !== 'none') refreshMap();
+}, 10000);
 </script>
 </body>
 </html>

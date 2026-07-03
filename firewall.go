@@ -198,6 +198,7 @@ func (fw *firewall) middleware(e *core.RequestEvent) error {
 
 	// never lock out loopback
 	if ip != nil && ip.IsLoopback() {
+		fw.r.trackClient(ipStr, false)
 		return e.Next()
 	}
 
@@ -208,13 +209,16 @@ func (fw *firewall) middleware(e *core.RequestEvent) error {
 
 	// lock-out guard: authenticated superusers bypass app-scope rules
 	if scope == fwScopeApp && *fw.r.cfg.FirewallExemptSuperusers && e.HasSuperuserAuth() {
+		fw.r.trackClient(ipStr, false)
 		return e.Next()
 	}
 
 	if fw.allowed(scope, ip) {
+		fw.r.trackClient(ipStr, false)
 		return e.Next()
 	}
 
+	fw.r.trackClient(ipStr, true)
 	fw.r.stats.blocked.Add(1)
 	return e.Error(http.StatusForbidden, "Access denied by firewall rules.", nil)
 }

@@ -145,6 +145,20 @@ func createTables(app core.App) error {
 			src_node TEXT PRIMARY KEY NOT NULL,
 			min_seq  INTEGER NOT NULL DEFAULT 0
 		)`,
+		`CREATE TABLE IF NOT EXISTS _repl_client_ips (
+			ip         TEXT PRIMARY KEY NOT NULL,
+			first_seen TEXT NOT NULL DEFAULT '',
+			last_seen  TEXT NOT NULL DEFAULT '',
+			requests   INTEGER NOT NULL DEFAULT 0,
+			blocked    INTEGER NOT NULL DEFAULT 0,
+			country    TEXT NOT NULL DEFAULT '',
+			region     TEXT NOT NULL DEFAULT '',
+			city       TEXT NOT NULL DEFAULT '',
+			lat        REAL NOT NULL DEFAULT 0,
+			lon        REAL NOT NULL DEFAULT 0,
+			geo_status TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS _repl_client_ips_seen_idx ON _repl_client_ips (last_seen)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := app.NonconcurrentDB().NewQuery(stmt).Execute(); err != nil {

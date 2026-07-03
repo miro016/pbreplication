@@ -539,6 +539,75 @@ func TestFirewallMatcher(t *testing.T) {
 	}
 }
 
+func TestClientTrackingAndGeoCache(t *testing.T) {
+	app, r := newTestNode(t, "nodeA0000000001")
+
+	// buffered counting -> batched flush
+	r.trackClient("127.0.0.1", false)
+	r.trackClient("127.0.0.1", false)
+	r.trackClient("8.8.8.8", false)
+	r.trackClient("8.8.8.8", true)
+	r.flushClients()
+
+	var loop clientRow
+	if err := app.DB().NewQuery(`SELECT * FROM _repl_client_ips WHERE ip = '127.0.0.1'`).One(&loop); err != nil {
+		t.Fatal(err)
+	}
+	if loop.Requests != 2 || loop.Blocked != 0 || loop.GeoStatus != geoPrivate {
+		t.Fatalf("bad loopback row: %+v", loop)
+	}
+
+	var pub clientRow
+	if err := app.DB().NewQuery(`SELECT * FROM _repl_client_ips WHERE ip = '8.8.8.8'`).One(&pub); err != nil {
+		t.Fatal(err)
+	}
+	if pub.Requests != 2 || pub.Blocked != 1 || pub.GeoStatus != geoPending {
+		t.Fatalf("bad public row: %+v", pub)
+	}
+
+	// counters accumulate across flushes
+	r.trackClient("8.8.8.8", true)
+	r.flushClients()
+	_ = app.DB().NewQuery(`SELECT * FROM _repl_client_ips WHERE ip = '8.8.8.8'`).One(&pub)
+	if pub.Requests != 3 || pub.Blocked != 2 {
+		t.Fatalf("counters did not accumulate: %+v", pub)
+	}
+
+	// geolocation: exactly one lookup per IP, result cached
+	calls := 0
+	r.geoLookup = func(ip string) (*geoResult, error) {
+		calls++
+		if ip != "8.8.8.8" {
+			t.Fatalf("unexpected lookup for %s", ip)
+		}
+		return &geoResult{Status: "success", CountryCode: "US", Region: "CA", City: "Mountain View", Lat: 37.4, Lon: -122.1}, nil
+	}
+	if !r.geoStep() {
+		t.Fatal("expected a pending lookup")
+	}
+	if r.geoStep() {
+		t.Fatal("no lookup should remain pending (loopback is private, 8.8.8.8 cached)")
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 ip-api call, got %d", calls)
+	}
+
+	_ = app.DB().NewQuery(`SELECT * FROM _repl_client_ips WHERE ip = '8.8.8.8'`).One(&pub)
+	if pub.GeoStatus != geoOK || pub.Country != "US" || pub.Region != "US-CA" || pub.Lat == 0 {
+		t.Fatalf("geo result not cached: %+v", pub)
+	}
+
+	// GC keeps fresh rows
+	if err := gcClients(app.NonconcurrentDB(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_ = app.DB().NewQuery(`SELECT COUNT(*) FROM _repl_client_ips`).Row(&n)
+	if n != 2 {
+		t.Fatalf("gc removed fresh rows: %d left", n)
+	}
+}
+
 func TestFirewallCollectionCreated(t *testing.T) {
 	app, r := newTestNode(t, "nodeA0000000001")
 

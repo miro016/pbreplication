@@ -146,6 +146,7 @@ func (r *Replicator) compact() error {
 			}
 		}
 
-		return nil
+		// 6. prune stale/excess client IP rows (dashboard map data)
+		return gcClients(db, r.cfg.TombstoneRetention)
 	})
 }

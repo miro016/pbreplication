@@ -96,6 +96,11 @@ type Config struct {
 	// token bypass app-scope firewall rules so an admin can't lock
 	// themself out. Default: true.
 	FirewallExemptSuperusers *bool
+
+	// DisableIPGeolocation turns off the automatic geolocation of new
+	// client IPs via ip-api.com (used by the dashboard map). Client IPs
+	// are still counted; they just won't be located. Default: false.
+	DisableIPGeolocation bool
 }
 
 func (c *Config) setDefaults() {
@@ -171,6 +176,11 @@ type Replicator struct {
 
 	// last sync error per peer (empty entry = healthy), for the dashboard
 	memberErrs sync.Map // nodeID -> string
+
+	// buffered per-client-IP request counters (flushed in batches)
+	clientCounts sync.Map // ip -> *clientCounter
+	// geolocation resolver, overridable in tests
+	geoLookup func(ip string) (*geoResult, error)
 
 	// blobs that could not be fetched from any peer yet
 	blobMu          sync.Mutex
@@ -336,11 +346,12 @@ func (r *Replicator) startBackground() {
 		r.cursorMu.Unlock()
 	}
 
-	r.wg.Add(4)
+	r.wg.Add(5)
 	go r.pushLoop()
 	go r.antiEntropyLoop()
 	go r.applyLoop()
 	go r.compactLoop()
+	go r.geoLoop()
 
 	go func() {
 		if err := r.bootstrapOrRejoin(); err != nil {

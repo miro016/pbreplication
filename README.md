@@ -54,6 +54,9 @@ after downtime) is discovered and handled automatically.
   or region, managed from the dashboard, enforced on all routes with a
   separate scope for the replication endpoints. Rules replicate
   cluster-wide automatically.
+- **Client world map** — the dashboard plots every unique client IP on
+  a world map (geolocated once via ip-api.com and cached), with blocked
+  clients in red and countries under a deny rule shaded.
 - **Light on resources** — batched debounced pushes, periodic pulls,
   a single applier goroutine, oplog compaction and full garbage
   collection of all bookkeeping tables.
@@ -101,6 +104,7 @@ docker compose up --build
 | `DisableUIExtension` | `false` | Turn off the "Replication" tab injected into the admin UI. |
 | `GeoIPDBPath` | `""` | Path to a MaxMind-format `.mmdb` enabling country/region firewall rules. |
 | `FirewallExemptSuperusers` | `true` | Superuser-authenticated requests bypass app-scope firewall rules (lock-out guard). |
+| `DisableIPGeolocation` | `false` | Turn off the automatic one-time geolocation of client IPs via ip-api.com (dashboard map). |
 
 The example app maps `PBR_NODE_URL`, `PBR_SEED_URL`,
 `PBR_CLUSTER_SECRET` and `PBR_GEOIP_DB` env vars to these fields.
@@ -134,6 +138,16 @@ login from the browser automatically). Two tabs:
   progress, oplog size, pending/failed operations.
 - **Firewall**: manage allow/deny rules, see per-scope mode
   (blacklist/whitelist), GeoIP status and the blocked-request counter.
+- **Map**: a world map of every unique client IP this node has seen —
+  blue dots for allowed clients, red for clients with blocked requests,
+  countries under an active deny rule shaded red, and blocked regions
+  listed. Each new public IP is geolocated **once** via the free
+  [ip-api.com](https://ip-api.com) endpoint (well under its 45 req/min
+  limit) and cached forever; private/loopback addresses are counted but
+  not located. If you don't want any outbound geolocation calls, set
+  `DisableIPGeolocation: true`. Client IPs are tracked per node, kept
+  for `TombstoneRetention` (capped at 10k IPs), and correct client
+  addresses behind a proxy require PocketBase's trusted-proxy settings.
 
 Data endpoints (`/api/replication/status`,
 `/api/replication/firewall/summary`) require superuser auth.

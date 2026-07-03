@@ -287,6 +287,7 @@ func (r *Replicator) syncRound() {
 
 	r.retryPending()
 	r.retryMissingBlobs()
+	r.flushClients()
 
 	// periodically persist the clock so restarts resume monotonically
 	_ = setState(r.app.NonconcurrentDB(), stateHLC, r.clock.Current())
