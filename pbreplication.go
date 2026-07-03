@@ -163,6 +163,15 @@ type Replicator struct {
 	pendingMu  sync.Mutex
 	pendingOps []*op
 
+	// per-peer URL overrides: when a member's advertised URL is not
+	// reachable from THIS node (e.g. a docker-internal name gossiped to
+	// a node on another host) but another URL demonstrably works (the
+	// configured seed URL), connections use the override instead.
+	urlOverrides sync.Map // nodeID -> url
+
+	// last sync error per peer (empty entry = healthy), for the dashboard
+	memberErrs sync.Map // nodeID -> string
+
 	// blobs that could not be fetched from any peer yet
 	blobMu          sync.Mutex
 	missingBlobList []*missingBlob
@@ -285,14 +294,21 @@ func (r *Replicator) initStorage(app core.App) error {
 		r.clock.Resume(persisted)
 	}
 
-	// self membership row
-	if err := upsertMember(db, &member{
-		NodeID:    r.nodeID,
-		URL:       r.cfg.NodeURL,
-		Reachable: r.cfg.NodeURL != "",
-		LastSeen:  nowStr(),
-	}); err != nil {
-		return err
+	// Ensure the self membership row exists, but DON'T overwrite a
+	// previously stored URL here: initStorage also runs for one-off CLI
+	// commands (e.g. "superuser upsert") that may carry a different or
+	// empty NodeURL and must not clobber the advertised URL. The URL is
+	// (re)set authoritatively only when actually serving, in
+	// startBackground.
+	if existing, _ := getMember(db, r.nodeID); existing == nil {
+		if err := upsertMember(db, &member{
+			NodeID:    r.nodeID,
+			URL:       r.cfg.NodeURL,
+			Reachable: r.cfg.NodeURL != "",
+			LastSeen:  nowStr(),
+		}); err != nil {
+			return err
+		}
 	}
 
 	if err := r.ensureFirewallCollection(app); err != nil {
@@ -305,6 +321,15 @@ func (r *Replicator) initStorage(app core.App) error {
 }
 
 func (r *Replicator) startBackground() {
+	// Now that we are actually serving as a node, set our advertised
+	// URL authoritatively (a restart may use a new NodeURL).
+	_ = upsertMember(r.app.NonconcurrentDB(), &member{
+		NodeID:    r.nodeID,
+		URL:       r.cfg.NodeURL,
+		Reachable: r.cfg.NodeURL != "",
+		LastSeen:  nowStr(),
+	})
+
 	if head, err := maxRowID(r.app.DB()); err == nil {
 		r.cursorMu.Lock()
 		r.startRowID = head

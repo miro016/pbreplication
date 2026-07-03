@@ -23,6 +23,9 @@ type joinResponse struct {
 	NodeID  string           `json:"node_id"`
 	Members []*member        `json:"members"`
 	Vector  map[string]int64 `json:"vector"`
+	// URLVerified reports whether the seed could reach the URL the
+	// joiner advertised (callback ping succeeded).
+	URLVerified bool `json:"url_verified"`
 }
 
 type snapshotMeta struct {
@@ -104,6 +107,35 @@ func (r *Replicator) joinCluster() (*joinResponse, error) {
 		return nil, err
 	}
 	r.mergeMembers(resp.Members)
+
+	if r.cfg.NodeURL != "" && !resp.URLVerified {
+		r.logError("cluster peers cannot reach this node's advertised URL - "+
+			"check NodeURL/PBR_NODE_URL (it must be reachable from the OTHER nodes); "+
+			"replication continues in pull-only mode",
+			fmt.Errorf("seed could not call back %s", r.cfg.NodeURL))
+	}
+
+	// The member list carries the URL the seed advertises about ITSELF,
+	// which may only resolve inside the seed's own network (e.g. a
+	// docker-internal "http://node1:8090" while we joined through a
+	// public domain). If that advertised URL is not reachable from
+	// here, keep talking to the seed through the URL that demonstrably
+	// works.
+	if resp.NodeID != "" && resp.NodeID != r.nodeID {
+		advertised := ""
+		for _, m := range resp.Members {
+			if m.NodeID == resp.NodeID {
+				advertised = m.URL
+				break
+			}
+		}
+		if advertised != "" && advertised != r.cfg.SeedURL && !r.verifyPeerURL(advertised, resp.NodeID) {
+			r.urlOverrides.Store(resp.NodeID, r.cfg.SeedURL)
+			r.logInfo("seed advertises a URL that is not reachable from this node - using the configured seed URL instead",
+				"advertised", advertised, "using", r.cfg.SeedURL)
+		}
+	}
+
 	return &resp, nil
 }
 
@@ -117,7 +149,7 @@ func (r *Replicator) triggerSnapshotResync(from *member) {
 	go func() {
 		defer r.resyncInFlight.Store(false)
 		r.logInfo("peer compacted past our cursor - running snapshot resync", "peer", from.NodeID)
-		if err := r.snapshotFrom(from.URL, true); err != nil {
+		if err := r.snapshotFrom(r.peerURL(from), true); err != nil {
 			r.logError("snapshot resync failed", err)
 		}
 	}()

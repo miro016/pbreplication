@@ -40,6 +40,7 @@ type memberStatus struct {
 	JoinedAt  string `json:"joined_at"`
 	LastSeen  string `json:"last_seen"`
 	Applied   int64  `json:"applied_seq"` // our vector entry for this node
+	LastError string `json:"last_error,omitempty"`
 }
 
 func (r *Replicator) handleStatus(e *core.RequestEvent) error {
@@ -78,7 +79,7 @@ func (r *Replicator) handleStatus(e *core.RequestEvent) error {
 	}
 
 	for _, m := range members {
-		resp.Members = append(resp.Members, &memberStatus{
+		ms := &memberStatus{
 			NodeID:    m.NodeID,
 			URL:       m.URL,
 			Reachable: m.Reachable,
@@ -87,7 +88,14 @@ func (r *Replicator) handleStatus(e *core.RequestEvent) error {
 			JoinedAt:  m.JoinedAt,
 			LastSeen:  m.LastSeen,
 			Applied:   vector[m.NodeID],
-		})
+		}
+		if v, ok := r.memberErrs.Load(m.NodeID); ok {
+			ms.LastError, _ = v.(string)
+		}
+		if ov, ok := r.urlOverrides.Load(m.NodeID); ok {
+			ms.URL = ov.(string) + " (override, advertised: " + m.URL + ")"
+		}
+		resp.Members = append(resp.Members, ms)
 	}
 
 	return e.JSON(http.StatusOK, resp)

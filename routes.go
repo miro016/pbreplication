@@ -71,9 +71,10 @@ func (r *Replicator) handleJoin(e *core.RequestEvent) error {
 	r.logInfo("node joined", "node", req.NodeID, "url", req.URL, "reachable", reachable)
 
 	return e.JSON(http.StatusOK, &joinResponse{
-		NodeID:  r.nodeID,
-		Members: members,
-		Vector:  vector,
+		NodeID:      r.nodeID,
+		Members:     members,
+		Vector:      vector,
+		URLVerified: reachable,
 	})
 }
 

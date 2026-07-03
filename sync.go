@@ -190,7 +190,10 @@ func (r *Replicator) pushTargets() []*member {
 	}
 	targets := make([]*member, 0, len(all))
 	for _, m := range all {
-		if m.NodeID != r.nodeID && m.URL != "" && m.Reachable {
+		// reachability is asymmetric (the flag reflects the seed's view),
+		// so try any member with a URL - failures are cheap, visible via
+		// notePeerErr, and healed by anti-entropy
+		if m.NodeID != r.nodeID && m.URL != "" {
 			targets = append(targets, m)
 		}
 	}
@@ -217,9 +220,11 @@ func (r *Replicator) pushToPeer(p *member, memberList []*member) {
 
 		req := &pushRequest{Sender: r.senderInfo(), Ops: ops, Members: memberList}
 		var resp pushResponse
-		if err := r.callPeer(p.URL, http.MethodPost, "/api/replication/ops", req, &resp); err != nil {
+		if err := r.callPeer(r.peerURL(p), http.MethodPost, "/api/replication/ops", req, &resp); err != nil {
+			r.notePeerErr(p.NodeID, err)
 			return // anti-entropy will heal
 		}
+		r.clearPeerErr(p.NodeID)
 
 		cursor = last
 		r.cursorMu.Lock()
@@ -270,12 +275,14 @@ func (r *Replicator) syncRound() {
 	}
 
 	for _, m := range members {
-		if m.NodeID == r.nodeID || m.URL == "" || !m.Reachable {
+		if m.NodeID == r.nodeID || m.URL == "" {
 			continue
 		}
 		if err := r.pullFromPeer(m); err != nil {
+			r.notePeerErr(m.NodeID, err)
 			continue // unreachable peers are expected
 		}
+		r.clearPeerErr(m.NodeID)
 	}
 
 	r.retryPending()
@@ -294,7 +301,7 @@ func (r *Replicator) pullFromPeer(m *member) error {
 
 		req := &pullRequest{Sender: r.senderInfo(), Vector: vector, Limit: r.cfg.MaxBatch}
 		var resp pullResponse
-		if err := r.callPeer(m.URL, http.MethodPost, "/api/replication/pull", req, &resp); err != nil {
+		if err := r.callPeer(r.peerURL(m), http.MethodPost, "/api/replication/pull", req, &resp); err != nil {
 			return err
 		}
 
@@ -369,6 +376,29 @@ func (r *Replicator) mergeMembers(list []*member) {
 			_ = upsertMember(db, cur)
 		}
 	}
+}
+
+// peerURL returns the URL to use when contacting a member, honoring a
+// locally verified override of its advertised URL.
+func (r *Replicator) peerURL(m *member) string {
+	if v, ok := r.urlOverrides.Load(m.NodeID); ok {
+		return v.(string)
+	}
+	return m.URL
+}
+
+// notePeerErr records (and logs, on first occurrence) a failed exchange
+// with a peer, so connectivity problems are visible on the dashboard
+// instead of silently stalling replication.
+func (r *Replicator) notePeerErr(nodeID string, err error) {
+	if prev, _ := r.memberErrs.Load(nodeID); prev == nil || prev.(string) == "" {
+		r.logError("sync with peer "+nodeID+" failing", err)
+	}
+	r.memberErrs.Store(nodeID, err.Error())
+}
+
+func (r *Replicator) clearPeerErr(nodeID string) {
+	r.memberErrs.Store(nodeID, "")
 }
 
 // isHealthy reports whether a member was seen recently enough.

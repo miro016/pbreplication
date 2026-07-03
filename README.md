@@ -245,11 +245,34 @@ compaction horizon are automatically resynced from a full snapshot.
    bypasses caching for `/_/extensions.js`, then purge the edge cache
    once.
 
+**A node joins fine but goes offline seconds later and replication
+stops** — the classic cause: a node advertises a `PBR_NODE_URL` that
+the *other* nodes cannot reach (e.g. a docker-internal name like
+`http://node1:8090` while the peer sits on another host and joined
+through a public domain). The join works because it uses your
+configured seed URL, but the periodic sync switches to the advertised
+URLs from the member list and starts failing. Fixes:
+
+- Set every node's `PBR_NODE_URL` to a URL that is reachable **from the
+  other nodes** (public domain, VPN/private IP, ...). This is the
+  proper fix for multi-host clusters.
+- The dashboard's node table shows the exact failing URL and error
+  (⚠ under the URL), and each node logs a warning at join time when its
+  advertised URL can't be called back.
+- As a safety net, a joining node that can't reach the seed's
+  advertised URL automatically keeps using the configured seed URL for
+  that peer (shown as "override" in the dashboard).
+
 **Nodes don't see each other** — check that all nodes share the exact
 same `PBR_CLUSTER_SECRET`, that the seed URL is reachable *from inside*
 the node's network namespace (in compose, use service names like
 `http://node1:8090`, not `localhost`), and look at
-`/api/replication/status` / the dashboard for `last_error`.
+`/api/replication/status` / the dashboard for the per-node ⚠ errors and
+`last_error`. If node-to-node traffic passes through a CDN/WAF
+(Cloudflare etc.), make sure bot protection does not challenge the
+server-to-server calls — add a WAF skip rule for `/api/replication/*`,
+or better, point `PBR_NODE_URL` at a direct origin address so cluster
+traffic bypasses the CDN entirely.
 
 ## Testing
 

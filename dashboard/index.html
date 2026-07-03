@@ -154,7 +154,8 @@ async function refreshStatus() {
       card('missing files', st.missing_blobs);
     document.getElementById('memberRows').innerHTML = (st.members || []).map(m =>
       '<tr><td class="mono">' + esc(m.node_id) + (m.self ? ' <span class="pill gray">this node</span>' : '') + '</td>' +
-      '<td>' + (m.url ? esc(m.url) : '<i>pull-only</i>') + '</td>' +
+      '<td>' + (m.url ? esc(m.url) : '<i>pull-only</i>') +
+        (m.last_error ? '<div class="err">⚠ ' + esc(m.last_error) + '</div>' : '') + '</td>' +
       '<td><span class="pill ' + (m.healthy ? 'ok">healthy' : 'bad">offline') + '</span></td>' +
       '<td>' + (m.reachable ? 'push+pull' : 'pull-only') + '</td>' +
       '<td class="mono">' + esc(m.applied_seq) + '</td>' +

@@ -63,19 +63,19 @@ func (r *Replicator) fetchBlob(fsys *filesystem.System, colName, recordID, name,
 	// preferred source first
 	ordered := make([]*member, 0, len(members))
 	for _, m := range members {
-		if m.NodeID == preferNode && m.URL != "" && m.Reachable {
+		if m.NodeID == preferNode && m.URL != "" {
 			ordered = append(ordered, m)
 		}
 	}
 	for _, m := range members {
-		if m.NodeID != preferNode && m.NodeID != r.nodeID && m.URL != "" && m.Reachable {
+		if m.NodeID != preferNode && m.NodeID != r.nodeID && m.URL != "" {
 			ordered = append(ordered, m)
 		}
 	}
 
 	var lastErr error = fmt.Errorf("no reachable peers")
 	for _, m := range ordered {
-		rc, err := r.openPeerStream(m.URL, path)
+		rc, err := r.openPeerStream(r.peerURL(m), path)
 		if err != nil {
 			lastErr = err
 			continue
