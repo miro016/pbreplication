@@ -220,6 +220,30 @@ compaction horizon are automatically resynced from a full snapshot.
   database. Use long random secrets, HTTPS or a private network between
   nodes, and consider a `replication`-scope firewall whitelist.
 
+## Troubleshooting
+
+**The "Replication" tab doesn't show up in the admin UI**
+
+1. Make sure the running image/binary is current. The demo:
+   `git pull && docker compose build --no-cache && docker compose up -d`.
+   On startup each node logs `admin UI extension registered` — if that
+   line is missing, the binary is old or `DisableUIExtension` is set.
+2. Server-side check:
+   `curl -s http://localhost:8091/_/extensions.js | grep -c Replication`
+   — a number ≥ 1 means the server is fine and it's your **browser
+   cache**: PocketBase serves `/_/extensions.js` with a 14-day cache
+   header, so a browser that visited the admin UI before the extension
+   existed keeps using the old empty file. Hard-refresh the admin page
+   once (`Ctrl+Shift+R` / `Cmd+Shift+R`). Current versions of this
+   package override that header with `no-cache`, so this is a one-time
+   fix — future extension updates are picked up automatically.
+
+**Nodes don't see each other** — check that all nodes share the exact
+same `PBR_CLUSTER_SECRET`, that the seed URL is reachable *from inside*
+the node's network namespace (in compose, use service names like
+`http://node1:8090`, not `localhost`), and look at
+`/api/replication/status` / the dashboard for `last_error`.
+
 ## Testing
 
 ```bash

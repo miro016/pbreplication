@@ -5,6 +5,7 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"strings"
 
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -118,4 +119,19 @@ func (r *Replicator) registerUIExtension(se *core.ServeEvent) {
 		Name: "pbreplication",
 		FS:   sub,
 	})
+
+	// PocketBase serves /_/extensions.js from a fixed URL with a 14-day
+	// Cache-Control (apis/extensions.go) — browsers would keep loading a
+	// stale copy long after the extension script changed. PB only sets
+	// that header when none is present yet, so pre-setting no-cache here
+	// (our middleware runs before PB's priority-9999 extensions binder)
+	// makes browsers revalidate on every admin UI load.
+	se.Router.BindFunc(func(e *core.RequestEvent) error {
+		if strings.HasSuffix(e.Request.URL.Path, "/_/extensions.js") {
+			e.Response.Header().Set("Cache-Control", "no-cache")
+		}
+		return e.Next()
+	})
+
+	r.logInfo("admin UI extension registered (Replication tab in /_/)")
 }
