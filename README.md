@@ -237,6 +237,13 @@ compaction horizon are automatically resynced from a full snapshot.
    once (`Ctrl+Shift+R` / `Cmd+Shift+R`). Current versions of this
    package override that header with `no-cache`, so this is a one-time
    fix — future extension updates are picked up automatically.
+3. **Behind a CDN (e.g. Cloudflare)**: the edge may cache
+   `/_/extensions.js` and rewrite its cache headers (Cloudflare's
+   *Browser Cache TTL* setting overrides low origin max-age values), so
+   tab updates can lag even with the `no-cache` fix above. Set Browser
+   Cache TTL to "Respect Existing Headers" or add a cache rule that
+   bypasses caching for `/_/extensions.js`, then purge the edge cache
+   once.
 
 **Nodes don't see each other** — check that all nodes share the exact
 same `PBR_CLUSTER_SECRET`, that the seed URL is reachable *from inside*
