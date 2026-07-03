@@ -1,0 +1,10 @@
+# PocketBase data
+pb_data/
+*.db
+*.db-shm
+*.db-wal
+
+# build artifacts
+/pb
+example/pb
+dist/

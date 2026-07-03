@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PocketBase Replication</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#1c2430; --muted:#6a7382; --line:#e3e6ea;
+          --ok:#2e9e63; --bad:#d64545; --accent:#4f6ef7; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:14px 24px; display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  header .id { color:var(--muted); font-family:ui-monospace,monospace; font-size:12px; }
+  nav { display:flex; gap:4px; margin-left:auto; }
+  nav button { border:1px solid var(--line); background:var(--card); padding:6px 14px; border-radius:6px; cursor:pointer; font:inherit; }
+  nav button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  main { max-width:1080px; margin:24px auto; padding:0 16px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 16px; }
+  .card b { display:block; font-size:20px; }
+  .card span { color:var(--muted); font-size:12px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th,td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); font-size:13px; }
+  th { background:#fafbfc; color:var(--muted); font-weight:600; }
+  tr:last-child td { border-bottom:none; }
+  .pill { display:inline-block; padding:1px 9px; border-radius:99px; font-size:12px; color:#fff; }
+  .pill.ok { background:var(--ok); } .pill.bad { background:var(--bad); } .pill.gray { background:var(--muted); }
+  .mono { font-family:ui-monospace,monospace; font-size:12px; }
+  .err { color:var(--bad); font-size:12px; margin-top:10px; word-break:break-all; }
+  form.addrule { display:flex; gap:8px; flex-wrap:wrap; margin:16px 0; align-items:center; }
+  form.addrule select, form.addrule input { padding:6px 8px; border:1px solid var(--line); border-radius:6px; font:inherit; }
+  form.addrule button, td button { padding:5px 12px; border:1px solid var(--line); border-radius:6px; background:var(--card); cursor:pointer; font:inherit; }
+  form.addrule button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .hint { color:var(--muted); font-size:12px; margin:8px 0 16px; }
+  h2 { font-size:14px; margin:22px 0 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Replication cluster</h1>
+  <span class="id" id="selfId"></span>
+  <nav>
+    <button id="tabNodes" class="active" onclick="showTab('nodes')">Nodes</button>
+    <button id="tabFirewall" onclick="showTab('firewall')">Firewall</button>
+  </nav>
+</header>
+<main>
+  <section id="nodes">
+    <div class="cards" id="statCards"></div>
+    <table>
+      <thead><tr><th>Node</th><th>URL</th><th>Health</th><th>Mode</th><th>Applied seq</th><th>Last seen</th></tr></thead>
+      <tbody id="memberRows"><tr><td colspan="6">Loading…</td></tr></tbody>
+    </table>
+    <div class="err" id="statusErr"></div>
+  </section>
+
+  <section id="firewall" style="display:none">
+    <div class="cards" id="fwCards"></div>
+    <div class="hint">Explicit <b>deny</b> rules always win. As soon as a scope has at least one active <b>allow</b>
+      rule it switches to whitelist mode (everything not allowed is blocked). Loopback requests and authenticated
+      superusers (app scope) are never blocked. Country/region rules need a GeoIP database configured on the server.</div>
+    <form class="addrule" onsubmit="return addRule(event)">
+      <select id="ruAction"><option>deny</option><option>allow</option></select>
+      <select id="ruScope"><option>app</option><option>replication</option></select>
+      <select id="ruMatch"><option>ip</option><option>cidr</option><option>country</option><option>region</option></select>
+      <input id="ruValue" placeholder="203.0.113.7 / 10.0.0.0/8 / US / US-CA" required style="min-width:220px">
+      <input id="ruNote" placeholder="note (optional)">
+      <button class="primary">Add rule</button>
+    </form>
+    <table>
+      <thead><tr><th>Action</th><th>Scope</th><th>Match</th><th>Value</th><th>Note</th><th>Active</th><th></th></tr></thead>
+      <tbody id="ruleRows"><tr><td colspan="7">Loading…</td></tr></tbody>
+    </table>
+    <div class="err" id="fwErr"></div>
+  </section>
+</main>
+
+<script>
+const RULES = '/api/collections/pbr_firewall_rules/records';
+let token = '';
+
+function loadToken() {
+  try {
+    const raw = localStorage.getItem('__pb_superusers__');
+    if (raw) { const parsed = JSON.parse(raw); if (parsed && parsed.token) return parsed.token; }
+  } catch (_) {}
+  return sessionStorage.getItem('pbr_token') || '';
+}
+function ensureToken() {
+  if (!token) token = loadToken();
+  if (!token) {
+    token = prompt('Superuser auth token (log into the PocketBase admin UI on this host to skip this):') || '';
+    if (token) sessionStorage.setItem('pbr_token', token);
+  }
+  return token;
+}
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({'Authorization': ensureToken(), 'Content-Type': 'application/json'}, opts.headers || {});
+  const res = await fetch(path, opts);
+  if (res.status === 401 || res.status === 403) { token = ''; sessionStorage.removeItem('pbr_token'); }
+  if (!res.ok) throw new Error(res.status + ' ' + (await res.text()).slice(0, 300));
+  return res.status === 204 ? null : res.json();
+}
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function ago(iso) {
+  if (!iso) return '—';
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (s < 60) return Math.round(s) + 's ago';
+  if (s < 3600) return Math.round(s/60) + 'm ago';
+  return Math.round(s/3600) + 'h ago';
+}
+function card(label, value) { return '<div class="card"><b>' + esc(value) + '</b><span>' + esc(label) + '</span></div>'; }
+
+async function refreshStatus() {
+  try {
+    const st = await api('/api/replication/status');
+    document.getElementById('selfId').textContent = 'node ' + st.node_id + (st.node_url ? ' · ' + st.node_url : ' · pull-only');
+    document.getElementById('statCards').innerHTML =
+      card('members', (st.members || []).length) +
+      card('healthy', (st.members || []).filter(m => m.healthy).length) +
+      card('oplog entries', st.oplog_size) +
+      card('applied ops', st.applied_total) +
+      card('failed ops', st.failed_total) +
+      card('pending ops', st.pending_ops) +
+      card('missing files', st.missing_blobs);
+    document.getElementById('memberRows').innerHTML = (st.members || []).map(m =>
+      '<tr><td class="mono">' + esc(m.node_id) + (m.self ? ' <span class="pill gray">this node</span>' : '') + '</td>' +
+      '<td>' + (m.url ? esc(m.url) : '<i>pull-only</i>') + '</td>' +
+      '<td><span class="pill ' + (m.healthy ? 'ok">healthy' : 'bad">offline') + '</span></td>' +
+      '<td>' + (m.reachable ? 'push+pull' : 'pull-only') + '</td>' +
+      '<td class="mono">' + esc(m.applied_seq) + '</td>' +
+      '<td>' + (m.self ? 'now' : esc(ago(m.last_seen))) + '</td></tr>').join('') || '<tr><td colspan="6">No members</td></tr>';
+    document.getElementById('statusErr').textContent = st.last_error || '';
+  } catch (err) {
+    document.getElementById('statusErr').textContent = 'Status request failed: ' + err.message;
+  }
+}
+
+async function refreshFirewall() {
+  try {
+    const [sum, rules] = await Promise.all([
+      api('/api/replication/firewall/summary'),
+      api(RULES + '?perPage=200&sort=-created')
+    ]);
+    document.getElementById('fwCards').innerHTML =
+      card('active rules', sum.rule_count) +
+      card('blocked requests', sum.blocked_total) +
+      card('app scope', sum.whitelist_mode && sum.whitelist_mode.app ? 'whitelist' : 'blacklist') +
+      card('replication scope', sum.whitelist_mode && sum.whitelist_mode.replication ? 'whitelist' : 'blacklist') +
+      card('GeoIP', sum.geoip_enabled ? 'enabled' : (sum.geoip_error ? 'error' : 'not configured'));
+    document.getElementById('ruleRows').innerHTML = (rules.items || []).map(r =>
+      '<tr><td><span class="pill ' + (r.action === 'deny' ? 'bad' : 'ok') + '">' + esc(r.action) + '</span></td>' +
+      '<td>' + esc(r.scope) + '</td><td>' + esc(r.match_type) + '</td>' +
+      '<td class="mono">' + esc(r.value) + '</td><td>' + esc(r.note) + '</td>' +
+      '<td><button onclick="toggleRule(\'' + r.id + '\',' + !r.active + ')">' + (r.active ? 'on' : 'off') + '</button></td>' +
+      '<td><button onclick="deleteRule(\'' + r.id + '\')">delete</button></td></tr>').join('') ||
+      '<tr><td colspan="7">No rules defined — everything is allowed.</td></tr>';
+    document.getElementById('fwErr').textContent = sum.geoip_error ? 'GeoIP: ' + sum.geoip_error : '';
+  } catch (err) {
+    document.getElementById('fwErr').textContent = 'Firewall request failed: ' + err.message;
+  }
+}
+
+async function addRule(ev) {
+  ev.preventDefault();
+  try {
+    await api(RULES, {method: 'POST', body: JSON.stringify({
+      action: document.getElementById('ruAction').value,
+      scope: document.getElementById('ruScope').value,
+      match_type: document.getElementById('ruMatch').value,
+      value: document.getElementById('ruValue').value.trim(),
+      note: document.getElementById('ruNote').value,
+      active: true
+    })});
+    document.getElementById('ruValue').value = ''; document.getElementById('ruNote').value = '';
+    refreshFirewall();
+  } catch (err) { document.getElementById('fwErr').textContent = 'Add failed: ' + err.message; }
+  return false;
+}
+async function toggleRule(id, active) {
+  try { await api(RULES + '/' + id, {method: 'PATCH', body: JSON.stringify({active})}); refreshFirewall(); }
+  catch (err) { document.getElementById('fwErr').textContent = 'Update failed: ' + err.message; }
+}
+async function deleteRule(id) {
+  if (!confirm('Delete this rule?')) return;
+  try { await api(RULES + '/' + id, {method: 'DELETE'}); refreshFirewall(); }
+  catch (err) { document.getElementById('fwErr').textContent = 'Delete failed: ' + err.message; }
+}
+
+function showTab(name) {
+  document.getElementById('nodes').style.display = name === 'nodes' ? '' : 'none';
+  document.getElementById('firewall').style.display = name === 'firewall' ? '' : 'none';
+  document.getElementById('tabNodes').classList.toggle('active', name === 'nodes');
+  document.getElementById('tabFirewall').classList.toggle('active', name === 'firewall');
+  if (name === 'firewall') refreshFirewall();
+}
+
+refreshStatus();
+setInterval(refreshStatus, 5000);
+setInterval(() => { if (document.getElementById('firewall').style.display !== 'none') refreshFirewall(); }, 5000);
+</script>
+</body>
+</html>

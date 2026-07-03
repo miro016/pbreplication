@@ -1,0 +1,55 @@
+# 3-node PocketBase replication demo cluster.
+#
+#   cd example && docker compose up --build
+#
+#   node1 -> http://localhost:8091  (admin UI: http://localhost:8091/_/)
+#   node2 -> http://localhost:8092
+#   node3 -> http://localhost:8093
+#
+#   Replication dashboard on any node: /api/replication/dashboard
+
+x-common: &common
+  build:
+    context: ..
+    dockerfile: example/Dockerfile
+  environment: &common-env
+    PBR_CLUSTER_SECRET: "change-me-please-0123456789"
+
+services:
+  node1:
+    <<: *common
+    ports: ["8091:8090"]
+    environment:
+      <<: *common-env
+      PBR_NODE_URL: "http://node1:8090"
+      # first node: no seed
+    volumes: ["node1_data:/pb_data"]
+
+  node2:
+    <<: *common
+    ports: ["8092:8090"]
+    environment:
+      <<: *common-env
+      PBR_NODE_URL: "http://node2:8090"
+      PBR_SEED_URL: "http://node1:8090"
+    volumes: ["node2_data:/pb_data"]
+    depends_on:
+      node1:
+        condition: service_healthy
+
+  node3:
+    <<: *common
+    ports: ["8093:8090"]
+    environment:
+      <<: *common-env
+      PBR_NODE_URL: "http://node3:8090"
+      PBR_SEED_URL: "http://node1:8090"
+    volumes: ["node3_data:/pb_data"]
+    depends_on:
+      node1:
+        condition: service_healthy
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
