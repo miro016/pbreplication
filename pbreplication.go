@@ -82,6 +82,14 @@ type Config struct {
 	// collection. Default: true.
 	ReplicateSuperusers *bool
 
+	// DeferMigrationsUntilSynced makes a fresh node that joins an
+	// existing cluster (SeedURL set, first start) postpone the host
+	// app's migrations until AFTER the initial full snapshot sync, and
+	// then run only those the cluster hasn't already applied. This
+	// avoids re-running migrations and seeds whose effects already
+	// exist in the cluster. Default: true.
+	DeferMigrationsUntilSynced *bool
+
 	// DisableUIExtension turns off the "Replication" tab that is
 	// injected into the PocketBase admin UI via PocketBase's
 	// experimental UI extension API. The standalone dashboard at
@@ -130,6 +138,10 @@ func (c *Config) setDefaults() {
 	if c.ReplicateSuperusers == nil {
 		v := true
 		c.ReplicateSuperusers = &v
+	}
+	if c.DeferMigrationsUntilSynced == nil {
+		v := true
+		c.DeferMigrationsUntilSynced = &v
 	}
 	if c.FirewallExemptSuperusers == nil {
 		v := true
@@ -198,6 +210,12 @@ type Replicator struct {
 
 	// guards concurrent snapshot resyncs
 	resyncInFlight atomic.Bool
+
+	// app migrations held back until after the initial snapshot sync.
+	// Written once in initStorage (before apis.Serve/startBackground),
+	// afterwards read only by the bootstrap goroutine.
+	deferredMigrations core.MigrationsList
+	migrationsDeferred bool
 
 	firewall *firewall
 
@@ -333,6 +351,10 @@ func (r *Replicator) initStorage(app core.App) error {
 	}
 	r.firewall.reload(app)
 
+	if err := r.maybeDeferAppMigrations(app); err != nil {
+		return err
+	}
+
 	r.ready.Store(true)
 	return nil
 }
@@ -361,8 +383,20 @@ func (r *Replicator) startBackground() {
 	go r.geoLoop()
 
 	go func() {
-		if err := r.bootstrapOrRejoin(); err != nil {
-			r.logError("bootstrap failed (will keep retrying via anti-entropy)", err)
+		// Keep retrying until the initial bootstrap succeeds: a fresh
+		// node with deferred migrations has no app schema at all until
+		// the first snapshot lands.
+		for {
+			err := r.bootstrapOrRejoin()
+			if err == nil {
+				return
+			}
+			r.logError("bootstrap failed (retrying)", err)
+			select {
+			case <-r.stopCh:
+				return
+			case <-time.After(r.cfg.SyncInterval):
+			}
 		}
 	}()
 }

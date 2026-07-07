@@ -36,6 +36,11 @@ type snapshotMeta struct {
 	// HorizonHLC is the peer's tombstone GC cutoff: deletes older than
 	// this may already be compacted away on the peer.
 	HorizonHLC string `json:"horizon_hlc"`
+	// AppliedMigrations lists the file names in the peer's _migrations
+	// table so a joining node can skip migrations the cluster already
+	// ran. Deliberately NOT omitempty: nil means "peer too old to
+	// report", [] means "none applied".
+	AppliedMigrations []string `json:"applied_migrations"`
 }
 
 type snapshotRecordItem struct {
@@ -83,13 +88,28 @@ func (r *Replicator) bootstrapOrRejoin() error {
 	}
 
 	if done == "" {
-		if err := r.snapshotFrom(r.cfg.SeedURL, false); err != nil {
+		meta, err := r.snapshotFrom(r.cfg.SeedURL, false)
+		if err != nil {
 			return fmt.Errorf("initial snapshot failed: %w", err)
+		}
+		// Record which migrations the cluster already ran BEFORE
+		// marking the bootstrap done: if this fails, a restart must
+		// repeat defer+sync+import instead of running every deferred
+		// migration against the already-synced data.
+		if err := r.importClusterMigrations(meta.AppliedMigrations); err != nil {
+			return fmt.Errorf("importing cluster migration history failed: %w", err)
 		}
 		if err := setState(r.app.NonconcurrentDB(), stateBootstrapDone, nowStr()); err != nil {
 			return err
 		}
 		r.logInfo("initial bootstrap complete", "node", r.nodeID, "seed", r.cfg.SeedURL)
+		// Now run only the migrations the cluster has NOT applied. A
+		// failure here doesn't fail the bootstrap: on restart the defer
+		// branch is skipped and PocketBase's serve-time migration run
+		// retries exactly the unapplied ones.
+		if err := r.runDeferredMigrations(); err != nil {
+			r.logError("post-sync app migrations failed", err)
+		}
 	} else {
 		r.logInfo("rejoined cluster", "node", r.nodeID, "members", len(join.Members))
 	}
@@ -149,7 +169,7 @@ func (r *Replicator) triggerSnapshotResync(from *member) {
 	go func() {
 		defer r.resyncInFlight.Store(false)
 		r.logInfo("peer compacted past our cursor - running snapshot resync", "peer", from.NodeID)
-		if err := r.snapshotFrom(r.peerURL(from), true); err != nil {
+		if _, err := r.snapshotFrom(r.peerURL(from), true); err != nil {
 			r.logError("snapshot resync failed", err)
 		}
 	}()
@@ -164,10 +184,12 @@ func (r *Replicator) triggerSnapshotResync(from *member) {
 // deletes local records that no longer exist on the peer and whose
 // last local write predates the peer's tombstone horizon (guards
 // against resurrecting records whose tombstones were compacted away).
-func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) error {
+// The peer's snapshot meta is returned so callers can inspect it (e.g.
+// the applied-migrations list during the initial bootstrap).
+func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta, error) {
 	var meta snapshotMeta
 	if err := r.callPeer(baseURL, http.MethodGet, "/api/replication/snapshot/meta", nil, &meta); err != nil {
-		return err
+		return nil, err
 	}
 	r.mergeMembers(meta.Members)
 
@@ -197,7 +219,7 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) error {
 	// 2. records, collection by collection
 	cols, err := r.app.FindAllCollections()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, col := range cols {
 		if !r.isReplicated(col) {
@@ -225,12 +247,12 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) error {
 		cur, _ := loadVectorEntry(db, src)
 		if seq > cur {
 			if err := setState(db, stateVectorPrefix+src, fmt.Sprintf("%d", seq)); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
 
-	return nil
+	return &meta, nil
 }
 
 // snapshotCollection pages all records of one collection from the peer
@@ -375,14 +397,20 @@ func (r *Replicator) serveSnapshotMeta(e *core.RequestEvent) error {
 	}
 	members, _ := listMembers(r.app.DB(), false)
 
+	applied, err := listAppliedMigrations(r.app.DB())
+	if err != nil {
+		return e.InternalServerError("failed to list applied migrations", nil)
+	}
+
 	horizon := encodeHLC(uint64(time.Now().Add(-r.cfg.TombstoneRetention).UnixMilli()), 0)
 
 	return e.JSON(http.StatusOK, &snapshotMeta{
-		NodeID:      r.nodeID,
-		Collections: raws,
-		Vector:      vector,
-		Members:     members,
-		HorizonHLC:  horizon,
+		NodeID:            r.nodeID,
+		Collections:       raws,
+		Vector:            vector,
+		Members:           members,
+		HorizonHLC:        horizon,
+		AppliedMigrations: applied,
 	})
 }
 
