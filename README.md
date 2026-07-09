@@ -289,6 +289,18 @@ completion line reports how many collections and rows were migrated. A
 snapshot resync (triggered when a peer has compacted past this node's
 cursor) logs the same way.
 
+Ongoing anti-entropy pulls are logged too, but only when they actually
+carry new operations — an idle cluster stays quiet:
+
+```
+2026/07/09 09:20:14 [pbreplication] pulled 37 ops from node2
+```
+
+Large catch-ups (a node returning after downtime) show the same live,
+in-place progress counter while paging through the backlog, then settle
+into the final `pulled N ops from <peer>` line. These pull events are
+written to both stdout and the `_logs` table.
+
 Caveats:
 
 - On a fresh joining node `./app migrate up` reports nothing to apply
