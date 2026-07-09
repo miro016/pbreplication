@@ -268,6 +268,27 @@ node of a new cluster) migrations run normally at startup. Set
 `DeferMigrationsUntilSynced: false` to restore the old
 migrate-then-sync behavior.
 
+### Startup & migration logs
+
+Key lifecycle milestones are written to **both** the PocketBase logger
+(persisted in the `_logs` table and visible in the admin UI) **and** the
+process stdout, so you can follow a joining node live in the console:
+
+```
+2026/07/09 09:12:03 [pbreplication] instance connected to cluster node=abc123 seed=http://node1:8090 members=2
+2026/07/09 09:12:03 [pbreplication] starting initial data migration (full snapshot sync from seed) node=abc123 seed=http://node1:8090
+2026/07/09 09:12:04 [pbreplication] migrated "posts": 1280 rows
+2026/07/09 09:12:05 [pbreplication] migrated "users": 342 rows
+2026/07/09 09:12:05 [pbreplication] initial data migration complete collections=2 rows=1622
+2026/07/09 09:12:05 [pbreplication] initial bootstrap complete node=abc123 seed=http://node1:8090
+```
+
+Each collection shows a live, in-place progress counter while its rows
+are streaming in, then settles into a final per-collection total. The
+completion line reports how many collections and rows were migrated. A
+snapshot resync (triggered when a peer has compacted past this node's
+cursor) logs the same way.
+
 Caveats:
 
 - On a fresh joining node `./app migrate up` reports nothing to apply

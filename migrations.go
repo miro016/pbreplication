@@ -125,13 +125,19 @@ func (r *Replicator) runDeferredMigrations() error {
 		return nil
 	}
 
+	pending := len(r.deferredMigrations.Items())
+	r.logMilestone("running post-sync app migrations", "pending", pending)
+
 	applied, err := core.NewMigrationsRunner(r.app, r.deferredMigrations).Up()
 	if err != nil {
 		return err
 	}
 	for _, file := range applied {
 		r.logInfo("applied post-sync migration", "file", file)
+		r.console("  applied migration %q", file)
 	}
+
+	r.logMilestone("post-sync app migrations complete", "applied", len(applied), "skipped", pending-len(applied))
 
 	r.migrationsDeferred = false
 	r.deferredMigrations = core.MigrationsList{}
