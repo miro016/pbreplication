@@ -32,6 +32,15 @@ func (r *Replicator) NodeURL() string { return r.cfg.NodeURL }
 // is actively capturing and applying replicated writes.
 func (r *Replicator) Ready() bool { return r.ready.Load() }
 
+// Synced reports whether this node's local database is fully populated
+// with the cluster's schema and data: the initial snapshot sync AND any
+// post-sync deferred app migrations have completed. On a first/seed node
+// (no SeedURL) it becomes true as soon as the node marks itself
+// bootstrapped. Host apps that must not read app collections until the
+// schema exists (a fresh node defers its migrations until after the
+// snapshot) should gate their startup work on this.
+func (r *Replicator) Synced() bool { return r.synced.Load() }
+
 // memberURL returns the URL this node actually uses to reach the given
 // member: a learned override when the advertised URL isn't reachable
 // from here, otherwise the advertised URL.

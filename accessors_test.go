@@ -85,4 +85,10 @@ func TestAccessorsStandaloneIsLeader(t *testing.T) {
 	if r.NodeURL() != "http://solo0000000001.test:8090" {
 		t.Fatalf("unexpected NodeURL %q", r.NodeURL())
 	}
+	// Synced only flips true once the background bootstrap goroutine runs
+	// (not started in these unit tests), so it is false right after
+	// initStorage.
+	if r.Synced() {
+		t.Fatal("Synced should be false before the background bootstrap runs")
+	}
 }

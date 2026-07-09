@@ -167,6 +167,7 @@ type Replicator struct {
 	clock  *hlc
 	nodeID string
 	ready  atomic.Bool
+	synced atomic.Bool
 
 	client *http.Client
 
@@ -390,6 +391,11 @@ func (r *Replicator) startBackground() {
 		for {
 			err := r.bootstrapOrRejoin()
 			if err == nil {
+				// Initial snapshot sync AND the post-sync deferred
+				// migrations (if any) have completed, so the local DB
+				// now holds the full cluster schema and data. Host apps
+				// waiting on Synced() can proceed.
+				r.synced.Store(true)
 				return
 			}
 			r.logError("bootstrap failed (retrying)", err)
