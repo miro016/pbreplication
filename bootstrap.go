@@ -41,6 +41,11 @@ type snapshotMeta struct {
 	// ran. Deliberately NOT omitempty: nil means "peer too old to
 	// report", [] means "none applied".
 	AppliedMigrations []string `json:"applied_migrations"`
+	// Counts reports the peer's row count per replicated collection name
+	// so a joining node can estimate how long the full snapshot sync
+	// will take. nil/omitted means the peer predates this feature; the
+	// ETA is then simply not shown.
+	Counts map[string]int64 `json:"counts,omitempty"`
 }
 
 type snapshotRecordItem struct {
@@ -192,6 +197,7 @@ func (r *Replicator) triggerSnapshotResync(from *member) {
 type migrationStats struct {
 	collections []collectionStat
 	totalRows   int
+	elapsed     time.Duration
 }
 
 type collectionStat struct {
@@ -213,10 +219,86 @@ func (r *Replicator) logMigrationSummary(msg string, stats *migrationStats) {
 		r.logMilestone(msg, "collections", 0, "rows", 0)
 		return
 	}
-	r.logMilestone(msg, "collections", len(stats.collections), "rows", stats.totalRows)
+	r.logMilestone(msg, "collections", len(stats.collections), "rows", stats.totalRows,
+		"took", stats.elapsed.Round(time.Second).String())
 	for _, c := range stats.collections {
 		r.console("  migrated collection %q: %d rows", c.name, c.rows)
 	}
+}
+
+// syncProgress tracks how far a full snapshot sync has advanced so a
+// completion time can be estimated from the observed row rate. It is
+// used from a single goroutine (the snapshot loop), so it needs no
+// locking. When total is 0 (the peer did not report row counts) the ETA
+// is simply not shown.
+type syncProgress struct {
+	total    int64         // expected rows across all replicated collections
+	done     int64         // rows received so far
+	start    time.Time     // sync start
+	lastLog  time.Time     // last time an ETA line was persisted
+	logEvery time.Duration // min interval between persisted ETA lines
+}
+
+// etaRemaining estimates the time left based on the average row rate so
+// far. Returns 0 when it cannot yet be computed.
+func (p *syncProgress) etaRemaining() time.Duration {
+	if p == nil || p.total <= 0 || p.done <= 0 {
+		return 0
+	}
+	elapsed := time.Since(p.start)
+	if elapsed <= 0 {
+		return 0
+	}
+	rate := float64(p.done) / elapsed.Seconds() // rows/sec
+	if rate <= 0 {
+		return 0
+	}
+	remaining := p.total - p.done
+	if remaining <= 0 {
+		return 0
+	}
+	return time.Duration(float64(remaining) / rate * float64(time.Second))
+}
+
+func (p *syncProgress) percent() int {
+	if p == nil || p.total <= 0 {
+		return 0
+	}
+	if p.done >= p.total {
+		return 100
+	}
+	return int(p.done * 100 / p.total)
+}
+
+// etaString renders the remaining time for a console line.
+func (p *syncProgress) etaString() string {
+	eta := p.etaRemaining()
+	if eta <= 0 {
+		return "calculating"
+	}
+	return eta.Round(time.Second).String()
+}
+
+// maybeLogETA persists an ETA line to the PocketBase logger (visible in
+// _logs / the admin UI), throttled to logEvery so a large sync doesn't
+// flood the log table. The console progress line updates every page; the
+// persisted line is the durable "when will it be ready" record.
+func (r *Replicator) maybeLogETA(p *syncProgress) {
+	if p == nil || p.total <= 0 || p.done <= 0 {
+		return
+	}
+	if !p.lastLog.IsZero() && time.Since(p.lastLog) < p.logEvery {
+		return
+	}
+	eta := p.etaRemaining()
+	if eta <= 0 {
+		return
+	}
+	p.lastLog = time.Now()
+	r.logInfo("full sync progress",
+		"rows", p.done, "total", p.total, "percent", p.percent(),
+		"eta", eta.Round(time.Second).String(),
+		"ready_by", time.Now().Add(eta).Format("2006-01-02 15:04:05"))
 }
 
 // ---------------------------------------------------------------------
@@ -265,12 +347,26 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// total expected rows across replicated collections, for ETA. When
+	// the peer is too old to report counts (meta.Counts == nil) this
+	// stays 0 and no ETA is shown.
+	prog := &syncProgress{start: time.Now(), logEvery: 15 * time.Second}
+	for _, col := range cols {
+		if r.isReplicated(col) {
+			prog.total += meta.Counts[col.Name]
+		}
+	}
+	if prog.total > 0 {
+		r.logMilestone("estimating full sync duration", "rows_to_sync", prog.total)
+	}
+
 	stats := &migrationStats{}
 	for _, col := range cols {
 		if !r.isReplicated(col) {
 			continue
 		}
-		seen, rows, err := r.snapshotCollection(baseURL, meta.NodeID, col)
+		seen, rows, err := r.snapshotCollection(baseURL, meta.NodeID, col, prog)
 		if err != nil {
 			// skip this collection (anti-entropy will still converge it);
 			// crucially, do NOT reconcile against an incomplete seen-set
@@ -282,6 +378,7 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 			r.reconcileCollection(col, seen, meta.HorizonHLC)
 		}
 	}
+	stats.elapsed = time.Since(prog.start)
 
 	// 3. adopt the peer's vector (captured BEFORE the record paging, so
 	// anything written meanwhile is replayed afterwards - idempotent)
@@ -306,7 +403,7 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 // record ids present on the peer and the number of rows migrated
 // (successfully applied) into this node. It prints live progress to the
 // console as pages arrive.
-func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Collection) (map[string]bool, int, error) {
+func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Collection, prog *syncProgress) (map[string]bool, int, error) {
 	seen := map[string]bool{}
 	after := ""
 	migrated := 0
@@ -359,8 +456,20 @@ func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Coll
 			migrated++
 		}
 
-		// live progress line, updated in place per page
-		r.consoleProgress("migrating %q: %d rows synced...", col.Name, migrated)
+		// advance the overall counter and refresh the ETA
+		if prog != nil {
+			prog.done += int64(len(page.Items))
+		}
+
+		// live progress line, updated in place per page. Include the
+		// overall ETA when the peer reported row counts.
+		if prog != nil && prog.total > 0 {
+			r.consoleProgress("migrating %q: %d rows | overall %d/%d (%d%%) ETA %s",
+				col.Name, migrated, prog.done, prog.total, prog.percent(), prog.etaString())
+			r.maybeLogETA(prog)
+		} else {
+			r.consoleProgress("migrating %q: %d rows synced...", col.Name, migrated)
+		}
 
 		if page.NextAfter == "" || len(page.Items) == 0 {
 			r.consoleProgressDone("migrated %q: %d rows", col.Name, migrated)
@@ -439,12 +548,23 @@ func (r *Replicator) serveSnapshotMeta(e *core.RequestEvent) error {
 	}
 
 	raws := make([]json.RawMessage, 0, len(cols))
+	counts := make(map[string]int64, len(cols))
 	for _, col := range cols {
 		b, err := exportCollectionJSON(col)
 		if err != nil {
 			continue
 		}
 		raws = append(raws, b)
+
+		// row count per replicated collection, so the joiner can size
+		// the sync and estimate completion time (best-effort: a failed
+		// count just omits that collection from the ETA basis)
+		if r.isReplicated(col) {
+			var n int64
+			if err := r.app.DB().NewQuery(fmt.Sprintf("SELECT COUNT(*) FROM {{%s}}", col.Name)).Row(&n); err == nil {
+				counts[col.Name] = n
+			}
+		}
 	}
 
 	vector, err := r.currentVector()
@@ -467,6 +587,7 @@ func (r *Replicator) serveSnapshotMeta(e *core.RequestEvent) error {
 		Members:           members,
 		HorizonHLC:        horizon,
 		AppliedMigrations: applied,
+		Counts:            counts,
 	})
 }
 

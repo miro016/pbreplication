@@ -277,16 +277,30 @@ process stdout, so you can follow a joining node live in the console:
 ```
 2026/07/09 09:12:03 [pbreplication] instance connected to cluster node=abc123 seed=http://node1:8090 members=2
 2026/07/09 09:12:03 [pbreplication] starting initial data migration (full snapshot sync from seed) node=abc123 seed=http://node1:8090
-2026/07/09 09:12:04 [pbreplication] migrated "posts": 1280 rows
-2026/07/09 09:12:05 [pbreplication] migrated "users": 342 rows
-2026/07/09 09:12:05 [pbreplication] initial data migration complete collections=2 rows=1622
-2026/07/09 09:12:05 [pbreplication] initial bootstrap complete node=abc123 seed=http://node1:8090
+2026/07/09 09:12:03 [pbreplication] estimating full sync duration rows_to_sync=1500000
+2026/07/09 09:12:18 [pbreplication] full sync progress rows=210000 total=1500000 percent=14 eta=1m47s ready_by=2026-07-09 09:14:05
+2026/07/09 09:13:59 [pbreplication] migrated "posts": 1280000 rows
+2026/07/09 09:14:04 [pbreplication] migrated "users": 220000 rows
+2026/07/09 09:14:04 [pbreplication] initial data migration complete collections=2 rows=1500000 took=2m1s
+2026/07/09 09:14:04 [pbreplication] initial bootstrap complete node=abc123 seed=http://node1:8090
 ```
 
 Each collection shows a live, in-place progress counter while its rows
 are streaming in, then settles into a final per-collection total. The
-completion line reports how many collections and rows were migrated. A
-snapshot resync (triggered when a peer has compacted past this node's
+completion line reports how many collections and rows were migrated and
+how long the sync took.
+
+**Estimated completion time (ETA).** For large databases the seed
+reports its per-collection row counts, so a joining node knows the total
+up front and estimates when the full sync will finish. The live console
+line shows an `ETA` for the whole sync, and a throttled `full sync
+progress` line — carrying the percent complete, the estimated time
+remaining (`eta`), and the projected wall-clock finish time
+(`ready_by`) — is persisted to the `_logs` table roughly every 15
+seconds. (A seed running an older pbreplication version doesn't report
+counts; the sync still runs, just without an ETA.)
+
+A snapshot resync (triggered when a peer has compacted past this node's
 cursor) logs the same way.
 
 Ongoing anti-entropy pulls are logged too, but only when they actually
