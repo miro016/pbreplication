@@ -920,6 +920,58 @@ func fakeSeed(t *testing.T, meta any) *httptest.Server {
 	return srv
 }
 
+func TestSyncProgressETA(t *testing.T) {
+	// 100 of 200 rows done over ~10s => ~10 rows/s => ~10s remaining.
+	p := &syncProgress{
+		total: 200,
+		done:  100,
+		start: time.Now().Add(-10 * time.Second),
+	}
+	if got := p.percent(); got != 50 {
+		t.Fatalf("percent = %d, want 50", got)
+	}
+	eta := p.etaRemaining()
+	if eta < 8*time.Second || eta > 12*time.Second {
+		t.Fatalf("eta = %s, want ~10s", eta)
+	}
+
+	// no total reported by the peer -> no ETA
+	none := &syncProgress{total: 0, done: 5, start: time.Now().Add(-time.Second)}
+	if none.etaRemaining() != 0 {
+		t.Fatal("etaRemaining must be 0 when total is unknown")
+	}
+	if none.etaString() != "calculating" {
+		t.Fatalf("etaString = %q, want calculating", none.etaString())
+	}
+
+	// already complete -> 0 remaining, 100%
+	done := &syncProgress{total: 50, done: 50, start: time.Now().Add(-time.Second)}
+	if done.etaRemaining() != 0 || done.percent() != 100 {
+		t.Fatalf("complete: eta=%s percent=%d", done.etaRemaining(), done.percent())
+	}
+}
+
+func TestSnapshotMetaCountsWireShape(t *testing.T) {
+	// counts must serialize under the documented key and round-trip
+	b, err := json.Marshal(&snapshotMeta{Counts: map[string]int64{"posts": 1280}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"counts":{"posts":1280}`) {
+		t.Fatalf("counts must serialize under \"counts\": %s", b)
+	}
+
+	// omitempty: an old peer that never sets counts omits the key, which
+	// unmarshals to a nil map (the "no ETA" signal)
+	var m snapshotMeta
+	if err := json.Unmarshal([]byte(`{"node_id":"x"}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Counts != nil {
+		t.Fatal("absent counts must decode to a nil map")
+	}
+}
+
 func TestBootstrapDefersUntilSnapshot(t *testing.T) {
 	// export a collection from a stand-in "seed" app
 	seedApp := newTestAppOnly(t)
