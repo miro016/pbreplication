@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/miro016/pbreplication/compare/v0.2.0...v0.3.0) (2026-07-09)
+
+
+### Features
+
+* expose Members, PeerURLs and leader accessors ([dcb6c4c](https://github.com/miro016/pbreplication/commit/dcb6c4c8825bb3b44ab51b00f41f2ac938b2c8d0))
+* expose Members, PeerURLs and leader accessors ([de63758](https://github.com/miro016/pbreplication/commit/de63758fab2a78980da22e0a8385064cf9c4ce6b))
+
 ## [0.2.0](https://github.com/miro016/pbreplication/compare/v0.1.0...v0.2.0) (2026-07-09)
 
 
