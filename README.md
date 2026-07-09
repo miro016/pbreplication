@@ -268,6 +268,39 @@ node of a new cluster) migrations run normally at startup. Set
 `DeferMigrationsUntilSynced: false` to restore the old
 migrate-then-sync behavior.
 
+### Startup & migration logs
+
+Key lifecycle milestones are written to **both** the PocketBase logger
+(persisted in the `_logs` table and visible in the admin UI) **and** the
+process stdout, so you can follow a joining node live in the console:
+
+```
+2026/07/09 09:12:03 [pbreplication] instance connected to cluster node=abc123 seed=http://node1:8090 members=2
+2026/07/09 09:12:03 [pbreplication] starting initial data migration (full snapshot sync from seed) node=abc123 seed=http://node1:8090
+2026/07/09 09:12:04 [pbreplication] migrated "posts": 1280 rows
+2026/07/09 09:12:05 [pbreplication] migrated "users": 342 rows
+2026/07/09 09:12:05 [pbreplication] initial data migration complete collections=2 rows=1622
+2026/07/09 09:12:05 [pbreplication] initial bootstrap complete node=abc123 seed=http://node1:8090
+```
+
+Each collection shows a live, in-place progress counter while its rows
+are streaming in, then settles into a final per-collection total. The
+completion line reports how many collections and rows were migrated. A
+snapshot resync (triggered when a peer has compacted past this node's
+cursor) logs the same way.
+
+Ongoing anti-entropy pulls are logged too, but only when they actually
+carry new operations — an idle cluster stays quiet:
+
+```
+2026/07/09 09:20:14 [pbreplication] pulled 37 ops from node2
+```
+
+Large catch-ups (a node returning after downtime) show the same live,
+in-place progress counter while paging through the backlog, then settle
+into the final `pulled N ops from <peer>` line. These pull events are
+written to both stdout and the `_logs` table.
+
 Caveats:
 
 - On a fresh joining node `./app migrate up` reports nothing to apply

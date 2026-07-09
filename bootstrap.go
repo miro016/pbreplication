@@ -71,7 +71,7 @@ func (r *Replicator) bootstrapOrRejoin() error {
 			if err := setState(r.app.NonconcurrentDB(), stateBootstrapDone, nowStr()); err != nil {
 				return err
 			}
-			r.logInfo("cluster initialized", "node", r.nodeID)
+			r.logMilestone("cluster initialized (this is the first/seed node)", "node", r.nodeID)
 		}
 		return nil
 	}
@@ -87,11 +87,20 @@ func (r *Replicator) bootstrapOrRejoin() error {
 		return nil
 	}
 
+	// The instance has established contact with the cluster.
+	r.logMilestone("instance connected to cluster",
+		"node", r.nodeID, "seed", r.cfg.SeedURL, "members", len(join.Members))
+
 	if done == "" {
-		meta, err := r.snapshotFrom(r.cfg.SeedURL, false)
+		r.logMilestone("starting initial data migration (full snapshot sync from seed)",
+			"node", r.nodeID, "seed", r.cfg.SeedURL)
+
+		meta, stats, err := r.snapshotFrom(r.cfg.SeedURL, false)
 		if err != nil {
 			return fmt.Errorf("initial snapshot failed: %w", err)
 		}
+		r.logMigrationSummary("initial data migration complete", stats)
+
 		// Record which migrations the cluster already ran BEFORE
 		// marking the bootstrap done: if this fails, a restart must
 		// repeat defer+sync+import instead of running every deferred
@@ -102,7 +111,7 @@ func (r *Replicator) bootstrapOrRejoin() error {
 		if err := setState(r.app.NonconcurrentDB(), stateBootstrapDone, nowStr()); err != nil {
 			return err
 		}
-		r.logInfo("initial bootstrap complete", "node", r.nodeID, "seed", r.cfg.SeedURL)
+		r.logMilestone("initial bootstrap complete", "node", r.nodeID, "seed", r.cfg.SeedURL)
 		// Now run only the migrations the cluster has NOT applied. A
 		// failure here doesn't fail the bootstrap: on restart the defer
 		// branch is skipped and PocketBase's serve-time migration run
@@ -111,7 +120,7 @@ func (r *Replicator) bootstrapOrRejoin() error {
 			r.logError("post-sync app migrations failed", err)
 		}
 	} else {
-		r.logInfo("rejoined cluster", "node", r.nodeID, "members", len(join.Members))
+		r.logMilestone("rejoined cluster", "node", r.nodeID, "members", len(join.Members))
 	}
 
 	wake(r.pullWake)
@@ -168,11 +177,46 @@ func (r *Replicator) triggerSnapshotResync(from *member) {
 	}
 	go func() {
 		defer r.resyncInFlight.Store(false)
-		r.logInfo("peer compacted past our cursor - running snapshot resync", "peer", from.NodeID)
-		if _, err := r.snapshotFrom(r.peerURL(from), true); err != nil {
+		r.logMilestone("peer compacted past our cursor - starting snapshot resync", "peer", from.NodeID)
+		_, stats, err := r.snapshotFrom(r.peerURL(from), true)
+		if err != nil {
 			r.logError("snapshot resync failed", err)
+			return
 		}
+		r.logMigrationSummary("snapshot resync complete", stats)
 	}()
+}
+
+// migrationStats accumulates how many records were synced per collection
+// during a snapshot, for the console/log summary.
+type migrationStats struct {
+	collections []collectionStat
+	totalRows   int
+}
+
+type collectionStat struct {
+	name string
+	rows int
+}
+
+func (m *migrationStats) add(name string, rows int) {
+	m.collections = append(m.collections, collectionStat{name: name, rows: rows})
+	m.totalRows += rows
+}
+
+// logMigrationSummary writes a completion milestone (to the PocketBase
+// logger and stdout) followed by a per-collection breakdown on the
+// console, so operators can see exactly which collections were migrated
+// and how many rows each carried.
+func (r *Replicator) logMigrationSummary(msg string, stats *migrationStats) {
+	if stats == nil {
+		r.logMilestone(msg, "collections", 0, "rows", 0)
+		return
+	}
+	r.logMilestone(msg, "collections", len(stats.collections), "rows", stats.totalRows)
+	for _, c := range stats.collections {
+		r.console("  migrated collection %q: %d rows", c.name, c.rows)
+	}
 }
 
 // ---------------------------------------------------------------------
@@ -186,10 +230,10 @@ func (r *Replicator) triggerSnapshotResync(from *member) {
 // against resurrecting records whose tombstones were compacted away).
 // The peer's snapshot meta is returned so callers can inspect it (e.g.
 // the applied-migrations list during the initial bootstrap).
-func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta, error) {
+func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta, *migrationStats, error) {
 	var meta snapshotMeta
 	if err := r.callPeer(baseURL, http.MethodGet, "/api/replication/snapshot/meta", nil, &meta); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	r.mergeMembers(meta.Members)
 
@@ -219,19 +263,21 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 	// 2. records, collection by collection
 	cols, err := r.app.FindAllCollections()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	stats := &migrationStats{}
 	for _, col := range cols {
 		if !r.isReplicated(col) {
 			continue
 		}
-		seen, err := r.snapshotCollection(baseURL, meta.NodeID, col)
+		seen, rows, err := r.snapshotCollection(baseURL, meta.NodeID, col)
 		if err != nil {
 			// skip this collection (anti-entropy will still converge it);
 			// crucially, do NOT reconcile against an incomplete seen-set
 			r.logError("snapshot collection "+col.Name+" (skipped)", err)
 			continue
 		}
+		stats.add(col.Name, rows)
 		if reconcile {
 			r.reconcileCollection(col, seen, meta.HorizonHLC)
 		}
@@ -247,20 +293,23 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 		cur, _ := loadVectorEntry(db, src)
 		if seq > cur {
 			if err := setState(db, stateVectorPrefix+src, fmt.Sprintf("%d", seq)); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
 
-	return &meta, nil
+	return &meta, stats, nil
 }
 
 // snapshotCollection pages all records of one collection from the peer
 // and applies each through the LWW apply path. Returns the set of
-// record ids present on the peer.
-func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Collection) (map[string]bool, error) {
+// record ids present on the peer and the number of rows migrated
+// (successfully applied) into this node. It prints live progress to the
+// console as pages arrive.
+func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Collection) (map[string]bool, int, error) {
 	seen := map[string]bool{}
 	after := ""
+	migrated := 0
 
 	for {
 		path := fmt.Sprintf("/api/replication/snapshot/records?collection=%s&after=%s&limit=%d",
@@ -268,7 +317,8 @@ func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Coll
 
 		var page snapshotRecordsPage
 		if err := r.callPeer(baseURL, http.MethodGet, path, nil, &page); err != nil {
-			return seen, err
+			r.consoleProgressDone("migrating %q: interrupted after %d rows", col.Name, migrated)
+			return seen, migrated, err
 		}
 
 		for _, item := range page.Items {
@@ -304,11 +354,17 @@ func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Coll
 			if err := r.applyRecordOp(o); err != nil {
 				r.stats.failed.Add(1)
 				r.logError("snapshot: apply record "+col.Name+"/"+probe.ID, err)
+				continue
 			}
+			migrated++
 		}
 
+		// live progress line, updated in place per page
+		r.consoleProgress("migrating %q: %d rows synced...", col.Name, migrated)
+
 		if page.NextAfter == "" || len(page.Items) == 0 {
-			return seen, nil
+			r.consoleProgressDone("migrated %q: %d rows", col.Name, migrated)
+			return seen, migrated, nil
 		}
 		after = page.NextAfter
 	}
