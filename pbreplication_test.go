@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 )
@@ -652,4 +654,346 @@ func TestFirewallCollectionCreated(t *testing.T) {
 	if r.firewall.allowed(fwScopeApp, net.ParseIP("203.0.113.9")) {
 		t.Fatal("rule record did not take effect")
 	}
+}
+
+// ---------------------------------------------------------------------
+// deferred migrations (fresh node joining an existing cluster)
+
+// stashAppMigrations snapshots the global core.AppMigrations registry
+// and restores it when the test finishes, so tests can register fake
+// migrations without leaking into each other.
+func stashAppMigrations(t *testing.T) {
+	t.Helper()
+	orig := core.AppMigrations
+	core.AppMigrations = core.MigrationsList{}
+	t.Cleanup(func() { core.AppMigrations = orig })
+}
+
+// newTestNodeCfg is newTestNode with a caller-provided config, wired to
+// an app created beforehand (so fake migrations can be registered after
+// tests.NewTestApp ran its own migration pass but before initStorage).
+func newTestNodeCfg(t *testing.T, app *tests.TestApp, cfg Config) *Replicator {
+	t.Helper()
+	r, err := Register(app, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.initStorage(app); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func newTestAppOnly(t *testing.T) *tests.TestApp {
+	t.Helper()
+	app, err := tests.NewTestApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(app.Cleanup)
+	return app
+}
+
+func migrationApplied(t *testing.T, app core.App, file string) bool {
+	t.Helper()
+	var n int
+	err := app.DB().NewQuery(`SELECT COUNT(*) FROM _migrations WHERE file = {:f}`).
+		Bind(dbx.Params{"f": file}).Row(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n > 0
+}
+
+func TestDeferAppMigrationsDecision(t *testing.T) {
+	noop := func(txApp core.App) error { return nil }
+
+	register2 := func() {
+		core.AppMigrations.Register(noop, nil, "m1.go")
+		core.AppMigrations.Register(noop, nil, "m2.go")
+	}
+
+	// fresh node with a seed: migrations must be deferred
+	t.Run("fresh with seed", func(t *testing.T) {
+		stashAppMigrations(t)
+		app := newTestAppOnly(t)
+		register2()
+		r := newTestNodeCfg(t, app, Config{
+			NodeID:        "nodeA0000000001",
+			SeedURL:       "http://seed.test:8090",
+			ClusterSecret: testSecret,
+		})
+		if len(core.AppMigrations.Items()) != 0 {
+			t.Fatal("global registry not emptied")
+		}
+		if !r.migrationsDeferred || len(r.deferredMigrations.Items()) != 2 {
+			t.Fatalf("expected 2 deferred migrations, got %d (deferred=%v)",
+				len(r.deferredMigrations.Items()), r.migrationsDeferred)
+		}
+	})
+
+	// first node of a new cluster: untouched
+	t.Run("no seed", func(t *testing.T) {
+		stashAppMigrations(t)
+		app := newTestAppOnly(t)
+		register2()
+		r := newTestNodeCfg(t, app, Config{
+			NodeID:        "nodeA0000000001",
+			ClusterSecret: testSecret,
+		})
+		if len(core.AppMigrations.Items()) != 2 || r.migrationsDeferred {
+			t.Fatal("migrations must not be deferred without a seed")
+		}
+	})
+
+	// already bootstrapped: untouched
+	t.Run("already bootstrapped", func(t *testing.T) {
+		stashAppMigrations(t)
+		app := newTestAppOnly(t)
+		if err := createTables(app); err != nil {
+			t.Fatal(err)
+		}
+		if err := setState(app.NonconcurrentDB(), stateBootstrapDone, nowStr()); err != nil {
+			t.Fatal(err)
+		}
+		register2()
+		r := newTestNodeCfg(t, app, Config{
+			NodeID:        "nodeA0000000001",
+			SeedURL:       "http://seed.test:8090",
+			ClusterSecret: testSecret,
+		})
+		if len(core.AppMigrations.Items()) != 2 || r.migrationsDeferred {
+			t.Fatal("migrations must not be deferred after bootstrap_done")
+		}
+	})
+
+	// deferral disabled: untouched
+	t.Run("opt-out", func(t *testing.T) {
+		stashAppMigrations(t)
+		app := newTestAppOnly(t)
+		register2()
+		off := false
+		r := newTestNodeCfg(t, app, Config{
+			NodeID:                     "nodeA0000000001",
+			SeedURL:                    "http://seed.test:8090",
+			ClusterSecret:              testSecret,
+			DeferMigrationsUntilSynced: &off,
+		})
+		if len(core.AppMigrations.Items()) != 2 || r.migrationsDeferred {
+			t.Fatal("migrations must not be deferred when opted out")
+		}
+	})
+}
+
+func TestAppliedMigrationsListAndWireShape(t *testing.T) {
+	app := newTestAppOnly(t)
+
+	files, err := listAppliedMigrations(app.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files == nil {
+		t.Fatal("listAppliedMigrations must return a non-nil slice")
+	}
+	if len(files) == 0 {
+		t.Fatal("expected the test app's own migrations in _migrations")
+	}
+
+	// nil vs [] must be distinguishable on the wire (no omitempty)
+	b, err := json.Marshal(&snapshotMeta{AppliedMigrations: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"applied_migrations":[]`) {
+		t.Fatalf("empty applied_migrations must serialize as []: %s", b)
+	}
+}
+
+func TestImportAndRunDeferredMigrations(t *testing.T) {
+	stashAppMigrations(t)
+	app := newTestAppOnly(t)
+
+	m1Ran, m2Ran := false, false
+	core.AppMigrations.Register(func(txApp core.App) error {
+		m1Ran = true
+		return nil
+	}, nil, "m1.go")
+	core.AppMigrations.Register(func(txApp core.App) error {
+		m2Ran = true
+		col := core.NewBaseCollection("dm_two")
+		col.Fields.Add(&core.TextField{Name: "title"})
+		if err := txApp.Save(col); err != nil {
+			return err
+		}
+		rec := core.NewRecord(col)
+		rec.Set("title", "seeded")
+		return txApp.Save(rec)
+	}, nil, "m2.go")
+
+	r := newTestNodeCfg(t, app, Config{
+		NodeID:        "nodeA0000000001",
+		SeedURL:       "http://seed.test:8090",
+		ClusterSecret: testSecret,
+	})
+	if !r.migrationsDeferred {
+		t.Fatal("expected deferred migrations")
+	}
+
+	// the cluster applied m1 (plus files this node doesn't know)
+	if err := r.importClusterMigrations([]string{"m1.go", "unknown_elsewhere.go"}); err != nil {
+		t.Fatal(err)
+	}
+	if !migrationApplied(t, app, "m1.go") {
+		t.Fatal("m1.go must be marked applied")
+	}
+	if migrationApplied(t, app, "m2.go") || migrationApplied(t, app, "unknown_elsewhere.go") {
+		t.Fatal("only deferred files reported by the seed may be imported")
+	}
+
+	if err := r.runDeferredMigrations(); err != nil {
+		t.Fatal(err)
+	}
+	if m1Ran {
+		t.Fatal("m1 was applied cluster-wide and must not run")
+	}
+	if !m2Ran {
+		t.Fatal("m2 is new and must run after the sync")
+	}
+	if !migrationApplied(t, app, "m2.go") {
+		t.Fatal("m2.go must be recorded as applied")
+	}
+	if r.migrationsDeferred {
+		t.Fatal("deferred state must be cleared")
+	}
+
+	// m2's writes must be captured for replication
+	ops := lastOps(t, r, 2)
+	if ops[0].ColName != "dm_two" || ops[1].ColName != "dm_two" {
+		t.Fatalf("post-sync migration writes not captured: %+v", ops)
+	}
+
+	// nil applied list (old seed): everything is assumed applied
+	t.Run("nil applied list", func(t *testing.T) {
+		stashAppMigrations(t)
+		app2 := newTestAppOnly(t)
+		ran := false
+		core.AppMigrations.Register(func(txApp core.App) error {
+			ran = true
+			return nil
+		}, nil, "m3.go")
+		r2 := newTestNodeCfg(t, app2, Config{
+			NodeID:        "nodeB0000000001",
+			SeedURL:       "http://seed.test:8090",
+			ClusterSecret: testSecret,
+		})
+		if err := r2.importClusterMigrations(nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := r2.runDeferredMigrations(); err != nil {
+			t.Fatal(err)
+		}
+		if ran {
+			t.Fatal("with an unreported history all deferred migrations are assumed applied")
+		}
+		if !migrationApplied(t, app2, "m3.go") {
+			t.Fatal("m3.go must be marked applied")
+		}
+	})
+}
+
+// fakeSeed serves just enough of the replication API for a fresh node
+// to bootstrap against it.
+func fakeSeed(t *testing.T, meta any) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/replication/join", func(w http.ResponseWriter, req *http.Request) {
+		json.NewEncoder(w).Encode(&joinResponse{NodeID: "seed000000000001", URLVerified: true})
+	})
+	mux.HandleFunc("/api/replication/snapshot/meta", func(w http.ResponseWriter, req *http.Request) {
+		json.NewEncoder(w).Encode(meta)
+	})
+	mux.HandleFunc("/api/replication/snapshot/records", func(w http.ResponseWriter, req *http.Request) {
+		json.NewEncoder(w).Encode(&snapshotRecordsPage{})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestBootstrapDefersUntilSnapshot(t *testing.T) {
+	// export a collection from a stand-in "seed" app
+	seedApp := newTestAppOnly(t)
+	seedCol := makeTestCollection(t, seedApp, "seed_posts")
+	colJSON, err := exportCollectionJSON(seedCol)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := fakeSeed(t, &snapshotMeta{
+		NodeID:            "seed000000000001",
+		Collections:       []json.RawMessage{colJSON},
+		Vector:            map[string]int64{"seed000000000001": 1},
+		AppliedMigrations: []string{"m1.go"},
+	})
+
+	stashAppMigrations(t)
+	app := newTestAppOnly(t)
+	m1Ran, m2Ran := false, false
+	core.AppMigrations.Register(func(txApp core.App) error { m1Ran = true; return nil }, nil, "m1.go")
+	core.AppMigrations.Register(func(txApp core.App) error { m2Ran = true; return nil }, nil, "m2.go")
+
+	r := newTestNodeCfg(t, app, Config{
+		NodeID:        "nodeB0000000001",
+		SeedURL:       srv.URL,
+		ClusterSecret: testSecret,
+	})
+
+	if err := r.bootstrapOrRejoin(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := app.FindCollectionByNameOrId("seed_posts"); err != nil {
+		t.Fatal("snapshot collection missing after bootstrap")
+	}
+	if m1Ran {
+		t.Fatal("m1 was applied on the cluster and must not run")
+	}
+	if !m2Ran {
+		t.Fatal("m2 must run after the snapshot")
+	}
+	if !migrationApplied(t, app, "m1.go") || !migrationApplied(t, app, "m2.go") {
+		t.Fatal("both migrations must be recorded in _migrations")
+	}
+	if done, _ := getState(app.DB(), stateBootstrapDone); done == "" {
+		t.Fatal("bootstrap_done must be set")
+	}
+
+	// seed running an older library version: applied_migrations absent
+	t.Run("seed without migration history", func(t *testing.T) {
+		oldSrv := fakeSeed(t, map[string]any{
+			"node_id":     "seed000000000001",
+			"collections": []json.RawMessage{colJSON},
+			"vector":      map[string]int64{"seed000000000001": 1},
+		})
+
+		stashAppMigrations(t)
+		app2 := newTestAppOnly(t)
+		ran := false
+		core.AppMigrations.Register(func(txApp core.App) error { ran = true; return nil }, nil, "m1.go")
+
+		r2 := newTestNodeCfg(t, app2, Config{
+			NodeID:        "nodeC0000000001",
+			SeedURL:       oldSrv.URL,
+			ClusterSecret: testSecret,
+		})
+		if err := r2.bootstrapOrRejoin(); err != nil {
+			t.Fatal(err)
+		}
+		if ran {
+			t.Fatal("without a reported history all deferred migrations are assumed applied")
+		}
+		if !migrationApplied(t, app2, "m1.go") {
+			t.Fatal("m1.go must be marked applied")
+		}
+	})
 }

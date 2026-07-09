@@ -294,6 +294,8 @@ func (r *Replicator) syncRound() {
 }
 
 func (r *Replicator) pullFromPeer(m *member) error {
+	pulled := 0
+	progressShown := false
 	for {
 		vector, err := r.currentVector()
 		if err != nil {
@@ -303,6 +305,9 @@ func (r *Replicator) pullFromPeer(m *member) error {
 		req := &pullRequest{Sender: r.senderInfo(), Vector: vector, Limit: r.cfg.MaxBatch}
 		var resp pullResponse
 		if err := r.callPeer(r.peerURL(m), http.MethodPost, "/api/replication/pull", req, &resp); err != nil {
+			if progressShown {
+				r.consoleProgressDone("pull from %s interrupted after %d ops", m.NodeID, pulled)
+			}
 			return err
 		}
 
@@ -310,13 +315,20 @@ func (r *Replicator) pullFromPeer(m *member) error {
 		r.mergeMembers(resp.Members)
 
 		if resp.SnapshotRequired {
+			if pulled > 0 {
+				r.logPulled(m.NodeID, pulled, progressShown)
+			}
 			r.triggerSnapshotResync(m)
 			return nil
 		}
 
 		if err := r.ingestOps(resp.Ops); err != nil {
+			if progressShown {
+				r.consoleProgressDone("pull from %s interrupted after %d ops", m.NodeID, pulled)
+			}
 			return err
 		}
+		pulled += len(resp.Ops)
 
 		if len(resp.Ops) < r.cfg.MaxBatch {
 			// Complete pull: adopt the peer's vector. Safe because the
@@ -324,9 +336,31 @@ func (r *Replicator) pullFromPeer(m *member) error {
 			// ops it retains (superseded ops it compacted away are, by
 			// definition, covered by newer ops we just ingested). This
 			// also lets the vector move past holes left by compaction.
+			if pulled > 0 {
+				r.logPulled(m.NodeID, pulled, progressShown)
+			}
 			r.adoptVector(resp.Vector)
 			return nil
 		}
+
+		// a full page means more updates are still waiting on the peer -
+		// show a live, in-place progress line for the larger catch-up
+		r.consoleProgress("pulling updates from %s: %d ops...", m.NodeID, pulled)
+		progressShown = true
+	}
+}
+
+// logPulled reports that ongoing anti-entropy pulled fresh ops from a
+// peer, to both the PocketBase logger (persisted in _logs) and the
+// console. It only fires when ops were actually received, so an idle
+// cluster stays quiet. When a live progress line was shown (a multi-page
+// catch-up) the final line replaces it in place.
+func (r *Replicator) logPulled(peer string, ops int, progressShown bool) {
+	r.logInfo("pulled updates from peer", "peer", peer, "ops", ops)
+	if progressShown {
+		r.consoleProgressDone("pulled %d ops from %s", ops, peer)
+	} else {
+		r.console("pulled %d ops from %s", ops, peer)
 	}
 }
 

@@ -47,7 +47,9 @@ after downtime) is discovered and handled automatically.
   snapshot, files included.
 - **Migrations are safe** — schema changes replicate as idempotent
   operations; the same migration running on several nodes converges
-  (content-hash dedup + LWW).
+  (content-hash dedup + LWW). A fresh node joining a cluster doesn't
+  even run them: it syncs first and then runs only the migrations the
+  cluster hasn't applied yet.
 - **Cluster dashboard** — `/api/replication/dashboard` shows every
   node, its health, replication progress and errors.
 - **Built-in firewall** — allow/deny rules by IP, CIDR range, country
@@ -101,6 +103,7 @@ docker compose up --build
 | `CompactionInterval` | `1h` | How often the oplog/bookkeeping garbage collection runs. |
 | `ExcludeCollections` | `_mfas, _otps, _authOrigins` | Collections that stay node-local. |
 | `ReplicateSuperusers` | `true` | Replicate the `_superusers` collection. |
+| `DeferMigrationsUntilSynced` | `true` | A fresh node joining a cluster postpones the app's migrations until after the initial snapshot sync, then runs only those the cluster hasn't applied (see below). |
 | `DisableUIExtension` | `false` | Turn off the "Replication" tab injected into the admin UI. |
 | `GeoIPDBPath` | `""` | Path to a MaxMind-format `.mmdb` enabling country/region firewall rules. |
 | `FirewallExemptSuperusers` | `true` | Superuser-authenticated requests bypass app-scope firewall rules (lock-out guard). |
@@ -225,7 +228,8 @@ compaction horizon are automatically resynced from a full snapshot.
 - **Migrations**: run the same binary/PB version on every node (natural
   with one Docker image). Create collections via migrations or on a
   single node — avoid creating a same-named collection independently on
-  two nodes at once.
+  two nodes at once. See "Migrations & seeding on joining nodes" below
+  for what happens on a fresh node.
 - **Files**: local storage only (each node keeps a full copy). If you
   use S3 storage, point all nodes at the same bucket and file
   replication becomes a no-op.
@@ -243,6 +247,74 @@ compaction horizon are automatically resynced from a full snapshot.
 - **Security**: the cluster secret grants full read/write to the whole
   database. Use long random secrets, HTTPS or a private network between
   nodes, and consider a `replication`-scope firewall whitelist.
+
+## Migrations & seeding on joining nodes
+
+A node that starts for the first time with a `SeedURL` does **not** run
+the app's migrations before serving. Instead it:
+
+1. pulls the full snapshot (schema + records + files) from the seed —
+   the effects of every migration and seed script the cluster already
+   ran arrive with it;
+2. marks the migrations the seed reports as applied in the local
+   `_migrations` table **without executing them**;
+3. runs only the remaining migrations (e.g. when the joining binary is
+   newer and ships migrations the cluster hasn't seen) — their writes
+   replicate out normally.
+
+This prevents re-running migrations and seed scripts whose results
+already exist in the cluster. On every later start (and on the first
+node of a new cluster) migrations run normally at startup. Set
+`DeferMigrationsUntilSynced: false` to restore the old
+migrate-then-sync behavior.
+
+### Startup & migration logs
+
+Key lifecycle milestones are written to **both** the PocketBase logger
+(persisted in the `_logs` table and visible in the admin UI) **and** the
+process stdout, so you can follow a joining node live in the console:
+
+```
+2026/07/09 09:12:03 [pbreplication] instance connected to cluster node=abc123 seed=http://node1:8090 members=2
+2026/07/09 09:12:03 [pbreplication] starting initial data migration (full snapshot sync from seed) node=abc123 seed=http://node1:8090
+2026/07/09 09:12:04 [pbreplication] migrated "posts": 1280 rows
+2026/07/09 09:12:05 [pbreplication] migrated "users": 342 rows
+2026/07/09 09:12:05 [pbreplication] initial data migration complete collections=2 rows=1622
+2026/07/09 09:12:05 [pbreplication] initial bootstrap complete node=abc123 seed=http://node1:8090
+```
+
+Each collection shows a live, in-place progress counter while its rows
+are streaming in, then settles into a final per-collection total. The
+completion line reports how many collections and rows were migrated. A
+snapshot resync (triggered when a peer has compacted past this node's
+cursor) logs the same way.
+
+Ongoing anti-entropy pulls are logged too, but only when they actually
+carry new operations — an idle cluster stays quiet:
+
+```
+2026/07/09 09:20:14 [pbreplication] pulled 37 ops from node2
+```
+
+Large catch-ups (a node returning after downtime) show the same live,
+in-place progress counter while paging through the backlog, then settle
+into the final `pulled N ops from <peer>` line. These pull events are
+written to both stdout and the `_logs` table.
+
+Caveats:
+
+- On a fresh joining node `./app migrate up` reports nothing to apply
+  until the first successful sync — the deferral also holds for the
+  CLI.
+- Migrations whose effects don't replicate (seeding records into
+  `ExcludeCollections`, raw node-local SQL) are marked applied but
+  their node-local effects won't exist on joiners. Keep node-local
+  seeding out of app migrations, or disable the option.
+- Mixed-version rollout: a seed running a pbreplication version older
+  than this feature can't report its migration history; the joiner then
+  assumes *all* of its migrations were already applied cluster-wide (a
+  warning is logged). Upgrade the seed node before shipping new
+  migrations.
 
 ## Troubleshooting
 

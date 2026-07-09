@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,6 +83,14 @@ type Config struct {
 	// collection. Default: true.
 	ReplicateSuperusers *bool
 
+	// DeferMigrationsUntilSynced makes a fresh node that joins an
+	// existing cluster (SeedURL set, first start) postpone the host
+	// app's migrations until AFTER the initial full snapshot sync, and
+	// then run only those the cluster hasn't already applied. This
+	// avoids re-running migrations and seeds whose effects already
+	// exist in the cluster. Default: true.
+	DeferMigrationsUntilSynced *bool
+
 	// DisableUIExtension turns off the "Replication" tab that is
 	// injected into the PocketBase admin UI via PocketBase's
 	// experimental UI extension API. The standalone dashboard at
@@ -130,6 +139,10 @@ func (c *Config) setDefaults() {
 	if c.ReplicateSuperusers == nil {
 		v := true
 		c.ReplicateSuperusers = &v
+	}
+	if c.DeferMigrationsUntilSynced == nil {
+		v := true
+		c.DeferMigrationsUntilSynced = &v
 	}
 	if c.FirewallExemptSuperusers == nil {
 		v := true
@@ -198,6 +211,12 @@ type Replicator struct {
 
 	// guards concurrent snapshot resyncs
 	resyncInFlight atomic.Bool
+
+	// app migrations held back until after the initial snapshot sync.
+	// Written once in initStorage (before apis.Serve/startBackground),
+	// afterwards read only by the bootstrap goroutine.
+	deferredMigrations core.MigrationsList
+	migrationsDeferred bool
 
 	firewall *firewall
 
@@ -333,6 +352,10 @@ func (r *Replicator) initStorage(app core.App) error {
 	}
 	r.firewall.reload(app)
 
+	if err := r.maybeDeferAppMigrations(app); err != nil {
+		return err
+	}
+
 	r.ready.Store(true)
 	return nil
 }
@@ -361,8 +384,20 @@ func (r *Replicator) startBackground() {
 	go r.geoLoop()
 
 	go func() {
-		if err := r.bootstrapOrRejoin(); err != nil {
-			r.logError("bootstrap failed (will keep retrying via anti-entropy)", err)
+		// Keep retrying until the initial bootstrap succeeds: a fresh
+		// node with deferred migrations has no app schema at all until
+		// the first snapshot lands.
+		for {
+			err := r.bootstrapOrRejoin()
+			if err == nil {
+				return
+			}
+			r.logError("bootstrap failed (retrying)", err)
+			select {
+			case <-r.stopCh:
+				return
+			case <-time.After(r.cfg.SyncInterval):
+			}
 		}
 	}()
 }
@@ -400,6 +435,56 @@ func (r *Replicator) logInfo(msg string, args ...any) {
 	if r.app != nil && r.app.Logger() != nil {
 		r.app.Logger().Info("pbreplication: "+msg, args...)
 	}
+}
+
+// logMilestone records a notable lifecycle event (instance connected,
+// migration started/finished, ...) to BOTH the PocketBase logger (so it
+// is persisted in the _logs table and visible in the admin UI) and the
+// process stdout (so operators watching the console see it live, even
+// though the PocketBase logger does not print there).
+func (r *Replicator) logMilestone(msg string, args ...any) {
+	r.logInfo(msg, args...)
+	fmt.Fprintln(os.Stdout, formatConsoleLine(msg, args...))
+}
+
+// console prints a formatted line to stdout with the standard
+// pbreplication prefix. Used for informational output that complements
+// the persisted logs (e.g. per-collection sync summaries).
+func (r *Replicator) console(format string, args ...any) {
+	fmt.Fprintf(os.Stdout, "%s [pbreplication] %s\n",
+		time.Now().Format("2006/01/02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+// consoleProgress updates a single, in-place console line (carriage
+// return, no newline) so a long-running sync can show live progress
+// without flooding the terminal. Call consoleProgressDone to terminate
+// the line once the operation completes.
+func (r *Replicator) consoleProgress(format string, args ...any) {
+	fmt.Fprintf(os.Stdout, "\r%s [pbreplication] %s",
+		time.Now().Format("2006/01/02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+// consoleProgressDone finalizes an in-place progress line with a final
+// message and a trailing newline.
+func (r *Replicator) consoleProgressDone(format string, args ...any) {
+	fmt.Fprintf(os.Stdout, "\r\033[K%s [pbreplication] %s\n",
+		time.Now().Format("2006/01/02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+// formatConsoleLine renders a message plus slog-style key/value args
+// into a single human-readable console line.
+func formatConsoleLine(msg string, args ...any) string {
+	var b strings.Builder
+	b.WriteString(time.Now().Format("2006/01/02 15:04:05"))
+	b.WriteString(" [pbreplication] ")
+	b.WriteString(msg)
+	for i := 0; i+1 < len(args); i += 2 {
+		fmt.Fprintf(&b, " %v=%v", args[i], args[i+1])
+	}
+	if len(args)%2 == 1 {
+		fmt.Fprintf(&b, " %v", args[len(args)-1])
+	}
+	return b.String()
 }
 
 // wake performs a non-blocking signal on a wake channel.
