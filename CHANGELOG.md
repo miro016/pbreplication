@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/miro016/pbreplication/compare/v0.1.0...v0.2.0) (2026-07-09)
+
+
+### Features
+
+* run app migrations after the initial full sync on joining nodes ([c70f97b](https://github.com/miro016/pbreplication/commit/c70f97b816a726f7aea7273c7eaa1686366983c7))
+
 ## 0.1.0 (2026-07-03)
 
 
