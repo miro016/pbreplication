@@ -1,6 +1,7 @@
 package pbreplication
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -216,11 +217,13 @@ func (r *Replicator) lookupGeoIPAPI(ip string) (*geoResult, error) {
 		endpoint = "https://pro.ip-api.com/json/" + url.PathEscape(ip) +
 			"?fields=" + fields + "&key=" + url.QueryEscape(r.cfg.IPAPIKey)
 	}
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	ctx, cancel := context.WithTimeout(r.runCtx, r.cfg.RequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := r.client.Do(req)
+	resp, err := r.jsonClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

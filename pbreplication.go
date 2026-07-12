@@ -21,9 +21,11 @@
 package pbreplication
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -34,6 +36,18 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/security"
 )
+
+// newPeerTransport builds the shared HTTP transport for node-to-node
+// calls: bounded dial and response-header phases, but no overall
+// request timeout (per-call deadlines come from contexts).
+func newPeerTransport() *http.Transport {
+	return &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+}
 
 // Config configures a cluster node.
 type Config struct {
@@ -115,6 +129,24 @@ type Config struct {
 	// geolocation uses the HTTPS pro endpoint (higher rate limit, no
 	// public-network throttling). When empty the free endpoint is used.
 	IPAPIKey string
+
+	// RequestTimeout bounds a single node-to-node JSON request
+	// (push/pull/join/meta pages). Streaming transfers (blobs, database
+	// snapshot chunks) are NOT subject to it; they use per-chunk
+	// deadlines instead so large transfers survive slow links.
+	// Default: 30s.
+	RequestTimeout time.Duration
+
+	// MaxBodyBytes caps how much of a node-to-node request body is
+	// buffered in memory for HMAC verification. Push/pull payloads are
+	// already bounded by MaxBatch, so the default is generous.
+	// Default: 16MB.
+	MaxBodyBytes int64
+
+	// EventBufferSize is the capacity of the in-memory replication
+	// event ring buffer served at /api/replication/events and via
+	// (*Replicator).Events. Default: 512.
+	EventBufferSize int
 }
 
 func (c *Config) setDefaults() {
@@ -148,6 +180,15 @@ func (c *Config) setDefaults() {
 		v := true
 		c.FirewallExemptSuperusers = &v
 	}
+	if c.RequestTimeout <= 0 {
+		c.RequestTimeout = 30 * time.Second
+	}
+	if c.MaxBodyBytes <= 0 {
+		c.MaxBodyBytes = 16 << 20
+	}
+	if c.EventBufferSize <= 0 {
+		c.EventBufferSize = 512
+	}
 	c.NodeURL = strings.TrimRight(c.NodeURL, "/")
 	c.SeedURL = strings.TrimRight(c.SeedURL, "/")
 }
@@ -168,7 +209,18 @@ type Replicator struct {
 	nodeID string
 	ready  atomic.Bool
 
-	client *http.Client
+	// jsonClient serves bounded request/response exchanges; each call
+	// carries its own context deadline (cfg.RequestTimeout). streamClient
+	// has no overall timeout so long-running streams (blobs, database
+	// snapshot chunks) are not killed mid-transfer; it still bounds the
+	// dial and response-header phases.
+	jsonClient   *http.Client
+	streamClient *http.Client
+
+	// runCtx is cancelled on shutdown; all outgoing peer requests are
+	// derived from it.
+	runCtx    context.Context
+	runCancel context.CancelFunc
 
 	pushWake chan struct{}
 	pullWake chan struct{}
@@ -238,11 +290,22 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 		return nil, err
 	}
 
+	runCtx, runCancel := context.WithCancel(context.Background())
 	r := &Replicator{
-		app:         app,
-		cfg:         cfg,
-		clock:       newHLC(),
-		client:      &http.Client{Timeout: 30 * time.Second},
+		app:   app,
+		cfg:   cfg,
+		clock: newHLC(),
+		jsonClient: &http.Client{
+			// no flat Timeout: every call sets a context deadline
+			Transport: newPeerTransport(),
+		},
+		streamClient: &http.Client{
+			// no overall timeout: streams are bounded per chunk by the
+			// caller; the transport still bounds dial + header phases
+			Transport: newPeerTransport(),
+		},
+		runCtx:      runCtx,
+		runCancel:   runCancel,
 		pushWake:    make(chan struct{}, 1),
 		pullWake:    make(chan struct{}, 1),
 		applyCh:     make(chan *op, 4096),
@@ -405,6 +468,7 @@ func (r *Replicator) startBackground() {
 func (r *Replicator) shutdown() {
 	r.stopOnce.Do(func() {
 		close(r.stopCh)
+		r.runCancel()
 	})
 	r.wg.Wait()
 	if r.nodeID != "" {
