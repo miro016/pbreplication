@@ -71,6 +71,11 @@ func (r *Replicator) bootstrapOrRejoin() error {
 		return err
 	}
 
+	// offline writes rescued during a full-copy resync are re-applied
+	// (and re-emitted) as soon as the node is up - purely local work,
+	// independent of cluster reachability
+	r.replayRescuedOps()
+
 	if r.cfg.SeedURL == "" {
 		// first node of a new cluster (or a standalone restart)
 		if done == "" {
@@ -181,6 +186,26 @@ func (r *Replicator) triggerSnapshotResync(from *member) {
 	if !r.resyncInFlight.CompareAndSwap(false, true) {
 		return
 	}
+
+	// restart-copy strategy: don't crawl the whole database row by row -
+	// flag the node and let the next process start install a full copy
+	// (rescuing local unsynced writes first).
+	if r.cfg.ResyncStrategy == "restart-copy" {
+		defer r.resyncInFlight.Store(false)
+		if pending, _ := getState(r.app.DB(), stateResyncPending); pending != "" {
+			return // already flagged; waiting for the restart
+		}
+		if err := setState(r.app.NonconcurrentDB(), stateResyncPending, nowStr()); err != nil {
+			r.logError("flagging resync_pending", err)
+			return
+		}
+		r.logMilestone("peer compacted past our cursor - full copy scheduled; RESTART THIS NODE to perform it",
+			"peer", from.NodeID)
+		r.emitEvent(EventSyncStarted, "full-copy resync scheduled - restart this node to perform it",
+			"peer", from.NodeID)
+		return
+	}
+
 	go func() {
 		defer r.resyncInFlight.Store(false)
 		r.logMilestone("peer compacted past our cursor - starting snapshot resync", "peer", from.NodeID)

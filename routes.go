@@ -23,6 +23,8 @@ func (r *Replicator) registerRoutes(se *core.ServeEvent) {
 	n.GET("/file/{collection}/{recordId}/{filename}", r.handleFile)
 	n.GET("/snapshot/meta", r.serveSnapshotMeta)
 	n.GET("/snapshot/records", r.serveSnapshotRecords)
+	n.POST("/snapshot/db", r.handleDBSnapshotPrepare)
+	n.GET("/snapshot/db/chunk", r.handleDBSnapshotChunk)
 
 	// --- admin endpoints ---
 	g.GET("/status", r.handleStatus).Bind(apis.RequireSuperuserAuth())

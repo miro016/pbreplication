@@ -291,6 +291,7 @@ func (r *Replicator) syncRound() {
 
 	r.retryPending()
 	r.retryMissingBlobs()
+	r.maybeBackfillBlobs()
 	r.flushClients()
 
 	// periodically persist the clock so restarts resume monotonically

@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -147,6 +148,39 @@ type Config struct {
 	// event ring buffer served at /api/replication/events and via
 	// (*Replicator).Events. Default: 512.
 	EventBufferSize int
+
+	// FullCopyBootstrap makes a NEW node (no local database yet) copy
+	// the seed's whole SQLite database file instead of syncing row by
+	// row - orders of magnitude faster for large databases. The copy
+	// happens BEFORE PocketBase opens the database, so serve-time
+	// migrations run only the files the cluster hasn't applied and the
+	// node starts already in sync. Old seeds without snapshot support
+	// fall back to the logical sync automatically. Default: true.
+	FullCopyBootstrap *bool
+
+	// FullCopyChunkSize is the transfer chunk for database snapshot
+	// downloads. Each chunk is fetched (and retried) independently, so
+	// unstable links resume instead of restarting. Default: 8MB.
+	FullCopyChunkSize int
+
+	// FullCopyFallbackAfter bounds how long a failing full copy is
+	// retried before the node falls back to the logical bootstrap.
+	// Default: 10m.
+	FullCopyFallbackAfter time.Duration
+
+	// SnapshotCacheTTL is how long a prepared database snapshot file is
+	// reused for additional joiners before a fresh one is vacuumed.
+	// Default: 10m.
+	SnapshotCacheTTL time.Duration
+
+	// ResyncStrategy selects how a node that fell behind compaction
+	// (snapshot_required) catches up:
+	//   "logical"      - row-by-row snapshot sync in-process (default)
+	//   "restart-copy" - flag the node (resync_pending) and ask for a
+	//                    restart; the next start replaces the database
+	//                    with a full copy, rescuing un-synced local
+	//                    writes first. Best for very large databases.
+	ResyncStrategy string
 }
 
 func (c *Config) setDefaults() {
@@ -189,6 +223,22 @@ func (c *Config) setDefaults() {
 	if c.EventBufferSize <= 0 {
 		c.EventBufferSize = 512
 	}
+	if c.FullCopyBootstrap == nil {
+		v := true
+		c.FullCopyBootstrap = &v
+	}
+	if c.FullCopyChunkSize <= 0 {
+		c.FullCopyChunkSize = 8 << 20
+	}
+	if c.FullCopyFallbackAfter <= 0 {
+		c.FullCopyFallbackAfter = 10 * time.Minute
+	}
+	if c.SnapshotCacheTTL <= 0 {
+		c.SnapshotCacheTTL = 10 * time.Minute
+	}
+	if c.ResyncStrategy == "" {
+		c.ResyncStrategy = "logical"
+	}
 	c.NodeURL = strings.TrimRight(c.NodeURL, "/")
 	c.SeedURL = strings.TrimRight(c.SeedURL, "/")
 }
@@ -196,6 +246,9 @@ func (c *Config) setDefaults() {
 func (c *Config) validate() error {
 	if len(c.ClusterSecret) < 16 {
 		return errors.New("pbreplication: ClusterSecret must be at least 16 characters")
+	}
+	if c.ResyncStrategy != "logical" && c.ResyncStrategy != "restart-copy" {
+		return fmt.Errorf("pbreplication: invalid ResyncStrategy %q (want \"logical\" or \"restart-copy\")", c.ResyncStrategy)
 	}
 	return nil
 }
@@ -285,6 +338,14 @@ type Replicator struct {
 	// guards concurrent snapshot resyncs
 	resyncInFlight atomic.Bool
 
+	// prepared database snapshot cache (server side of the full copy)
+	dbSnapMu       sync.Mutex
+	dbSnapManifest *dbSnapshotManifest
+	dbSnapCreated  time.Time
+
+	// guards concurrent blob backfill passes
+	blobBackfillInFlight atomic.Bool
+
 	// app migrations held back until after the initial snapshot sync.
 	// Written once in initStorage (before apis.Serve/startBackground),
 	// afterwards read only by the bootstrap goroutine.
@@ -346,6 +407,13 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 	r.firewall = newFirewall(r)
 
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
+		// BEFORE PocketBase opens its database: a new node (or one
+		// flagged for resync) installs a full copy of the cluster's
+		// database first, so PB boots directly on synced data and
+		// serve-time migrations run only what the cluster hasn't.
+		if err := r.maybeFullCopyBootstrap(e.App); err != nil {
+			return err
+		}
 		if err := e.Next(); err != nil {
 			return err
 		}
@@ -500,6 +568,10 @@ func (r *Replicator) shutdown() {
 	}
 	if r.firewall != nil {
 		r.firewall.close()
+	}
+	// prepared snapshot files are cheap to regenerate - don't keep them
+	if r.app != nil && r.app.DataDir() != "" {
+		_ = os.RemoveAll(filepath.Join(r.app.DataDir(), dbSnapshotDir))
 	}
 }
 

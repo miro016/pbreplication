@@ -25,6 +25,7 @@ func (r *Replicator) compactLoop() {
 			if err := r.compact(); err != nil {
 				r.logError("compaction failed", err)
 			}
+			r.cleanupDBSnapshots()
 		}
 	}
 }
