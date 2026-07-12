@@ -65,6 +65,7 @@ type ClusterStatus struct {
 	Sync         SyncStatus       `json:"sync"`
 	Counters     Counters         `json:"counters"`
 	PeerLags     map[string]int64 `json:"peer_lags"`
+	Integrity    *IntegrityReport `json:"integrity,omitempty"`
 	LastError    string           `json:"last_error,omitempty"`
 }
 
@@ -145,6 +146,7 @@ func (r *Replicator) Status() ClusterStatus {
 		Sync:         r.SyncStatus(),
 		Counters:     r.Counters(),
 		PeerLags:     r.PeerLags(),
+		Integrity:    r.LastIntegrityReport(),
 		LastError:    r.LastError(),
 	}
 }

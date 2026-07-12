@@ -76,6 +76,12 @@ func (r *Replicator) bootstrapOrRejoin() error {
 	// independent of cluster reachability
 	r.replayRescuedOps()
 
+	// a pending blob backfill means this database was installed via full
+	// copy - validate relation integrity once the deltas have settled
+	if pending, _ := getState(r.app.DB(), stateBlobBackfillPending); pending != "" {
+		r.scheduleIntegrityCheck()
+	}
+
 	if r.cfg.SeedURL == "" {
 		// first node of a new cluster (or a standalone restart)
 		if done == "" {
@@ -482,6 +488,7 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 	}
 
 	snapOK = true
+	r.scheduleIntegrityCheck()
 	return &meta, stats, nil
 }
 

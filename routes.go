@@ -30,6 +30,8 @@ func (r *Replicator) registerRoutes(se *core.ServeEvent) {
 	// --- admin endpoints ---
 	g.GET("/status", r.handleStatus).Bind(apis.RequireSuperuserAuth())
 	g.GET("/events", r.handleEvents).Bind(apis.RequireSuperuserAuth())
+	g.GET("/integrity", r.handleIntegrity).Bind(apis.RequireSuperuserAuth())
+	g.POST("/integrity/run", r.handleIntegrityRun).Bind(apis.RequireSuperuserAuth())
 	g.GET("/firewall/summary", r.handleFirewallSummary).Bind(apis.RequireSuperuserAuth())
 	g.GET("/clients", r.handleClients).Bind(apis.RequireSuperuserAuth())
 	g.GET("/clients/detail", r.handleClientDetail).Bind(apis.RequireSuperuserAuth())

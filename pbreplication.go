@@ -173,6 +173,12 @@ type Config struct {
 	// Default: 10m.
 	SnapshotCacheTTL time.Duration
 
+	// IntegrityCheckAfterSync runs a relation-integrity validation pass
+	// (dangling reference scan) after bulk syncs complete, re-checking
+	// while the node converges. Results surface in the logs, the event
+	// timeline, /status and LastIntegrityReport(). Default: true.
+	IntegrityCheckAfterSync *bool
+
 	// MigrationCoordinationTimeout bounds how long a starting node waits
 	// for peers to report their executed migrations before falling back
 	// to running the deferred migrations locally. Default: 30s.
@@ -240,6 +246,10 @@ func (c *Config) setDefaults() {
 	}
 	if c.SnapshotCacheTTL <= 0 {
 		c.SnapshotCacheTTL = 10 * time.Minute
+	}
+	if c.IntegrityCheckAfterSync == nil {
+		v := true
+		c.IntegrityCheckAfterSync = &v
 	}
 	if c.MigrationCoordinationTimeout <= 0 {
 		c.MigrationCoordinationTimeout = 30 * time.Second
@@ -353,6 +363,11 @@ type Replicator struct {
 
 	// guards concurrent blob backfill passes
 	blobBackfillInFlight atomic.Bool
+
+	// relation-integrity validation state
+	integrityPending  atomic.Bool
+	integrityInFlight atomic.Bool
+	lastIntegrity     atomic.Pointer[IntegrityReport]
 
 	// app migrations held back until after the initial snapshot sync.
 	// Written once in initStorage (before apis.Serve/startBackground),

@@ -29,6 +29,7 @@ type statusResponse struct {
 	Failed       int64            `json:"failed_total"`
 	Blocked      int64            `json:"blocked_total"`
 	Sync         SyncStatus       `json:"sync"`
+	Integrity    *IntegrityReport `json:"integrity,omitempty"`
 	LastError    string           `json:"last_error,omitempty"`
 }
 
@@ -76,6 +77,7 @@ func (r *Replicator) handleStatus(e *core.RequestEvent) error {
 		Failed:       r.stats.failed.Load(),
 		Blocked:      r.stats.blocked.Load(),
 		Sync:         r.SyncStatus(),
+		Integrity:    r.LastIntegrityReport(),
 	}
 	if v := r.stats.lastError.Load(); v != nil {
 		resp.LastError, _ = v.(string)
