@@ -171,6 +171,56 @@ func (r *Replicator) applyRecordOp(o *op) error {
 	})
 }
 
+// applySnapshotBatch applies a page of snapshot record ops inside ONE
+// transaction (vs. one transaction per record), with the authoritative
+// per-record LWW gate still evaluated inside the transaction. Any
+// failing record aborts the whole batch; callers fall back to the
+// per-record path so one bad row can't sink a page.
+//
+// Blob fetching must have happened before the call (it does network IO
+// and must stay outside the write transaction).
+func (r *Replicator) applySnapshotBatch(col *core.Collection, ops []*op) (int, error) {
+	applied := 0
+	err := r.app.RunInTransaction(func(txApp core.App) error {
+		db := txApp.NonconcurrentDB()
+		for _, o := range ops {
+			cur, err := getVersion(db, o.ColID, o.RecordID)
+			if err != nil {
+				return err
+			}
+			if !supersedes(o, cur) {
+				continue
+			}
+
+			rec, err := txApp.FindRecordById(col, o.RecordID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if rec == nil {
+				rec = core.NewRecord(col)
+				rec.Id = o.RecordID
+			}
+			if err := applyPayload(rec, o.Payload); err != nil {
+				return err
+			}
+			ctx := markedCtx(context.Background(), o)
+			if err := txApp.SaveNoValidateWithContext(ctx, rec); err != nil {
+				return err
+			}
+			if err := upsertVersion(db, o.ColID, o.RecordID, o.HLC, o.SrcNode, false); err != nil {
+				return err
+			}
+			applied++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	r.stats.applied.Add(int64(applied))
+	return applied, nil
+}
+
 // resolveCollection finds the local collection for an op, by id first
 // and by name as a fallback (covers the "same collection created
 // independently on two nodes with different random ids" case).

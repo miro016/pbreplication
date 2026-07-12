@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pocketbase/dbx"
@@ -26,6 +27,21 @@ const (
 	stateBootstrapDone = "bootstrap_done"
 	stateHLC           = "hlc"
 	stateVectorPrefix  = "vector." // + node id
+
+	// stateSnapshotResume holds the JSON progress of an interrupted
+	// logical snapshot sync so a restart resumes instead of re-paging
+	// every collection from scratch.
+	stateSnapshotResume = "snapshot_resume"
+
+	// stateResyncPending, when set, makes the next process start replace
+	// the local database with a full copy from a peer (rescuing
+	// unacknowledged local ops first).
+	stateResyncPending = "resync_pending"
+
+	// stateBlobBackfillPending, when set, makes sync rounds scan file
+	// fields for blobs missing from local storage (a full DB copy
+	// transfers no files) until a pass completes cleanly.
+	stateBlobBackfillPending = "blob_backfill_pending"
 )
 
 // collectionsColID is the pseudo collection id used in _repl_versions
@@ -169,6 +185,12 @@ func createTables(app core.App) error {
 			PRIMARY KEY (ip, method, path)
 		)`,
 		`CREATE INDEX IF NOT EXISTS _repl_client_paths_ip_idx ON _repl_client_paths (ip)`,
+		`CREATE TABLE IF NOT EXISTS _repl_sync_seen (
+			run_id TEXT NOT NULL,
+			col_id TEXT NOT NULL,
+			id     TEXT NOT NULL,
+			PRIMARY KEY (run_id, col_id, id)
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := app.NonconcurrentDB().NewQuery(stmt).Execute(); err != nil {
@@ -316,19 +338,29 @@ func opsAfterVector(db dbx.Builder, vector map[string]int64, limit int) (ops []*
 
 // advanceVector extends the contiguous per-source vector entry for src
 // as far as the oplog allows and persists it. Returns the new value.
+// Sequences are scanned in bounded batches so a huge backlog never
+// materializes as one big in-memory slice.
 func advanceVector(db dbx.Builder, src string, current int64) (int64, error) {
-	var seqs []int64
-	err := db.NewQuery(`SELECT src_seq FROM _repl_oplog
-		WHERE src_node = {:s} AND src_seq > {:c} ORDER BY src_seq LIMIT 10000`).
-		Bind(dbx.Params{"s": src, "c": current}).Column(&seqs)
-	if err != nil {
-		return current, err
-	}
+	const batch = 1024
 	next := current
-	for _, s := range seqs {
-		if s == next+1 {
-			next = s
-		} else if s > next+1 {
+	for {
+		var seqs []int64
+		err := db.NewQuery(`SELECT src_seq FROM _repl_oplog
+			WHERE src_node = {:s} AND src_seq > {:c} ORDER BY src_seq LIMIT {:l}`).
+			Bind(dbx.Params{"s": src, "c": next, "l": batch}).Column(&seqs)
+		if err != nil {
+			return current, err
+		}
+		contiguous := true
+		for _, s := range seqs {
+			if s == next+1 {
+				next = s
+			} else if s > next+1 {
+				contiguous = false
+				break
+			}
+		}
+		if !contiguous || len(seqs) < batch {
 			break
 		}
 	}
@@ -338,6 +370,49 @@ func advanceVector(db dbx.Builder, src string, current int64) (int64, error) {
 		}
 	}
 	return next, nil
+}
+
+// ---------------------------------------------------------------------
+// snapshot seen-set (persisted reconcile bookkeeping)
+
+// insertSyncSeen records ids observed on the snapshot source during a
+// reconcile run, in multi-row batches.
+func insertSyncSeen(db dbx.Builder, runID, colID string, ids []string) error {
+	const chunk = 100
+	for len(ids) > 0 {
+		n := len(ids)
+		if n > chunk {
+			n = chunk
+		}
+		var sb strings.Builder
+		sb.WriteString(`INSERT OR IGNORE INTO _repl_sync_seen (run_id, col_id, id) VALUES `)
+		params := dbx.Params{"r": runID, "c": colID}
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			key := fmt.Sprintf("i%d", i)
+			sb.WriteString("({:r}, {:c}, {:" + key + "})")
+			params[key] = ids[i]
+		}
+		if _, err := db.NewQuery(sb.String()).Bind(params).Execute(); err != nil {
+			return err
+		}
+		ids = ids[n:]
+	}
+	return nil
+}
+
+// deleteSyncSeen drops the seen-set of one run (or every run when
+// runID is empty).
+func deleteSyncSeen(db dbx.Builder, runID string) error {
+	if runID == "" {
+		_, err := db.NewQuery(`DELETE FROM _repl_sync_seen`).Execute()
+		return err
+	}
+	_, err := db.NewQuery(`DELETE FROM _repl_sync_seen WHERE run_id = {:r}`).
+		Bind(dbx.Params{"r": runID}).Execute()
+	return err
 }
 
 // loadVector reads all persisted vector entries.
