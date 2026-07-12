@@ -319,6 +319,14 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 	}
 	r.mergeMembers(meta.Members)
 
+	r.emitEvent(EventSnapshotStarted, "logical snapshot sync started",
+		"peer", meta.NodeID, "reconcile", reconcile)
+	snapOK := false
+	defer func() {
+		r.emitEvent(EventSnapshotFinished, "logical snapshot sync finished",
+			"peer", meta.NodeID, "ok", snapOK)
+	}()
+
 	// 1. schema first
 	for _, raw := range meta.Collections {
 		var probe struct {
@@ -395,6 +403,7 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 		}
 	}
 
+	snapOK = true
 	return &meta, stats, nil
 }
 

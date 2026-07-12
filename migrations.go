@@ -138,6 +138,8 @@ func (r *Replicator) runDeferredMigrations() error {
 	}
 
 	r.logMilestone("post-sync app migrations complete", "applied", len(applied), "skipped", pending-len(applied))
+	r.emitEvent(EventMigrationRun, "post-sync app migrations complete",
+		"applied", len(applied), "skipped", pending-len(applied))
 
 	r.migrationsDeferred = false
 	r.deferredMigrations = core.MigrationsList{}

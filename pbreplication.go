@@ -247,6 +247,24 @@ type Replicator struct {
 	// last sync error per peer (empty entry = healthy), for the dashboard
 	memberErrs sync.Map // nodeID -> string
 
+	// replication event timeline (ring buffer + subscribers)
+	events *eventLog
+
+	// last observed health per peer, for transition detection
+	healthMu   sync.Mutex
+	prevHealth map[string]bool
+
+	// most recent vector reported by each peer (from push/pull
+	// responses); the basis for replication-lag reporting
+	peerVectors sync.Map // nodeID -> map[string]int64
+
+	// last time the periodic lag summary was logged
+	lastLagLog atomic.Int64 // unix seconds
+
+	// throttle for op-failure events (per collection)
+	opFailMu   sync.Mutex
+	opFailLast map[string]time.Time
+
 	// buffered per-client-IP request counters (flushed in batches)
 	clientCounts sync.Map // ip -> *clientCounter
 	// buffered per-(ip,method,path) counters
@@ -312,6 +330,9 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 		stopCh:      make(chan struct{}),
 		pushCursors: map[string]int64{},
 		excluded:    map[string]bool{},
+		events:      newEventLog(cfg.EventBufferSize),
+		prevHealth:  map[string]bool{},
+		opFailLast:  map[string]time.Time{},
 	}
 	for _, name := range cfg.ExcludeCollections {
 		r.excluded[name] = true
@@ -488,17 +509,31 @@ func (r *Replicator) isReplicated(col *core.Collection) bool {
 	return !r.excluded[col.Name] && !r.excluded[col.Id]
 }
 
-func (r *Replicator) logError(msg string, err error) {
-	r.stats.lastError.Store(fmt.Sprintf("%s: %v", msg, err))
-	if r.app != nil && r.app.Logger() != nil {
-		r.app.Logger().Error("pbreplication: "+msg, slog.String("error", err.Error()))
+// log routes a message to the PocketBase logger with the standard
+// component attribute prepended, so replication entries are filterable
+// in the _logs table.
+func (r *Replicator) log(level slog.Level, msg string, args ...any) {
+	if r.app == nil || r.app.Logger() == nil {
+		return
 	}
+	all := make([]any, 0, len(args)+2)
+	all = append(all, slog.String("component", "pbreplication"))
+	all = append(all, args...)
+	r.app.Logger().Log(context.Background(), level, "pbreplication: "+msg, all...)
+}
+
+func (r *Replicator) logError(msg string, err error, args ...any) {
+	r.stats.lastError.Store(fmt.Sprintf("%s: %v", msg, err))
+	all := append([]any{slog.String("error", err.Error())}, args...)
+	r.log(slog.LevelError, msg, all...)
+}
+
+func (r *Replicator) logWarn(msg string, args ...any) {
+	r.log(slog.LevelWarn, msg, args...)
 }
 
 func (r *Replicator) logInfo(msg string, args ...any) {
-	if r.app != nil && r.app.Logger() != nil {
-		r.app.Logger().Info("pbreplication: "+msg, args...)
-	}
+	r.log(slog.LevelInfo, msg, args...)
 }
 
 // logMilestone records a notable lifecycle event (instance connected,

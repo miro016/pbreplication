@@ -2,6 +2,7 @@ package pbreplication
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
@@ -25,6 +26,7 @@ func (r *Replicator) registerRoutes(se *core.ServeEvent) {
 
 	// --- admin endpoints ---
 	g.GET("/status", r.handleStatus).Bind(apis.RequireSuperuserAuth())
+	g.GET("/events", r.handleEvents).Bind(apis.RequireSuperuserAuth())
 	g.GET("/firewall/summary", r.handleFirewallSummary).Bind(apis.RequireSuperuserAuth())
 	g.GET("/clients", r.handleClients).Bind(apis.RequireSuperuserAuth())
 	g.GET("/clients/detail", r.handleClientDetail).Bind(apis.RequireSuperuserAuth())
@@ -72,7 +74,11 @@ func (r *Replicator) handleJoin(e *core.RequestEvent) error {
 		return e.InternalServerError("failed to compute vector", nil)
 	}
 
-	r.logInfo("node joined", "node", req.NodeID, "url", req.URL, "reachable", reachable)
+	r.logInfo("node joined", "peer", req.NodeID, "url", req.URL, "reachable", reachable)
+	if req.NodeID != r.nodeID {
+		r.emitEvent(EventNodeJoined, "node joined the cluster",
+			"peer", req.NodeID, "url", req.URL, "reachable", reachable)
+	}
 
 	return e.JSON(http.StatusOK, &joinResponse{
 		NodeID:      r.nodeID,
@@ -175,6 +181,19 @@ func (r *Replicator) noteSender(s senderInfo) {
 		cur.Reachable = true
 	}
 	_ = upsertMember(db, cur)
+}
+
+// handleEvents serves the replication event timeline, newest first.
+func (r *Replicator) handleEvents(e *core.RequestEvent) error {
+	limit := 200
+	if v := e.Request.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	return e.JSON(http.StatusOK, map[string]any{
+		"events": r.Events(limit),
+	})
 }
 
 // handleFile streams a stored record file to a peer.

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -24,10 +25,37 @@ func (r *Replicator) applyLoop() {
 		case o := <-r.applyCh:
 			if err := r.applyOp(o); err != nil {
 				r.stats.failed.Add(1)
-				r.logError(fmt.Sprintf("apply %s %s/%s (from %s#%d)", o.Type, o.ColName, o.RecordID, o.SrcNode, o.SrcSeq), err)
+				r.logError(fmt.Sprintf("apply %s %s/%s (from %s#%d)", o.Type, o.ColName, o.RecordID, o.SrcNode, o.SrcSeq), err,
+					"peer", o.SrcNode, "collection", o.ColName)
+				r.emitOpFailed(o, err)
 			}
 		}
 	}
+}
+
+// emitOpFailed puts an apply failure on the event timeline, throttled
+// to at most one event per collection per second so a burst of
+// conflicting ops doesn't flood the ring buffer.
+func (r *Replicator) emitOpFailed(o *op, err error) {
+	if !r.throttleOK("op:"+o.ColName, time.Second) {
+		return
+	}
+	r.emitEvent(EventOpFailed, "failed to apply replicated op",
+		"peer", o.SrcNode, "collection", o.ColName,
+		"record", o.RecordID, "op", string(o.Type), "error", err.Error())
+}
+
+// throttleOK reports whether an action identified by key may fire again
+// (at most once per minGap), recording the attempt when it may.
+func (r *Replicator) throttleOK(key string, minGap time.Duration) bool {
+	r.opFailMu.Lock()
+	defer r.opFailMu.Unlock()
+	now := time.Now()
+	if last, ok := r.opFailLast[key]; ok && now.Sub(last) < minGap {
+		return false
+	}
+	r.opFailLast[key] = now
+	return true
 }
 
 // enqueueApply hands an op to the applier, blocking if the queue is

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/oschwald/maxminddb-golang"
 	"github.com/pocketbase/pocketbase/apis"
@@ -222,6 +223,12 @@ func (fw *firewall) middleware(e *core.RequestEvent) error {
 
 	fw.r.trackClient(ipStr, method, path, true)
 	fw.r.stats.blocked.Add(1)
+	// throttled per IP so a scanning client doesn't flood logs/events
+	if fw.r.throttleOK("fw:"+ipStr, 10*time.Second) {
+		fw.r.logWarn("firewall blocked request", "ip", ipStr, "method", method, "path", path, "scope", scope)
+		fw.r.emitEvent(EventFirewallBlock, "firewall blocked request",
+			"ip", ipStr, "method", method, "path", path, "scope", scope)
+	}
 	return e.Error(http.StatusForbidden, "Access denied by firewall rules.", nil)
 }
 
