@@ -10,6 +10,7 @@ import (
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/security"
 )
 
 // wire shapes ---------------------------------------------------------
@@ -70,6 +71,17 @@ func (r *Replicator) bootstrapOrRejoin() error {
 		return err
 	}
 
+	// offline writes rescued during a full-copy resync are re-applied
+	// (and re-emitted) as soon as the node is up - purely local work,
+	// independent of cluster reachability
+	r.replayRescuedOps()
+
+	// a pending blob backfill means this database was installed via full
+	// copy - validate relation integrity once the deltas have settled
+	if pending, _ := getState(r.app.DB(), stateBlobBackfillPending); pending != "" {
+		r.scheduleIntegrityCheck()
+	}
+
 	if r.cfg.SeedURL == "" {
 		// first node of a new cluster (or a standalone restart)
 		if done == "" {
@@ -78,6 +90,9 @@ func (r *Replicator) bootstrapOrRejoin() error {
 			}
 			r.logMilestone("cluster initialized (this is the first/seed node)", "node", r.nodeID)
 		}
+		// a seed node restarting with peers still coordinates its own
+		// new migrations against them
+		r.coordinateMigrations()
 		return nil
 	}
 
@@ -89,6 +104,9 @@ func (r *Replicator) bootstrapOrRejoin() error {
 			return fmt.Errorf("initial join via seed %s failed: %w", r.cfg.SeedURL, err)
 		}
 		r.logError("re-join announce failed (anti-entropy continues)", err)
+		// deferred migrations must still run - coordinateMigrations has
+		// its own peer-unreachable fallback
+		r.coordinateMigrations()
 		return nil
 	}
 
@@ -117,15 +135,17 @@ func (r *Replicator) bootstrapOrRejoin() error {
 			return err
 		}
 		r.logMilestone("initial bootstrap complete", "node", r.nodeID, "seed", r.cfg.SeedURL)
-		// Now run only the migrations the cluster has NOT applied. A
-		// failure here doesn't fail the bootstrap: on restart the defer
-		// branch is skipped and PocketBase's serve-time migration run
-		// retries exactly the unapplied ones.
-		if err := r.runDeferredMigrations(); err != nil {
-			r.logError("post-sync app migrations failed", err)
-		}
+		// Now run only the migrations NO cluster member has applied
+		// (the seed's own history was already imported above; the
+		// coordination union covers migrations other peers ran that the
+		// seed didn't). A failure here doesn't fail the bootstrap: the
+		// migration runner retries unapplied files on the next start.
+		r.coordinateMigrations()
 	} else {
 		r.logMilestone("rejoined cluster", "node", r.nodeID, "members", len(join.Members))
+		// an already-bootstrapped node may carry NEW migrations after an
+		// upgrade - never run one a peer already ran (duplicate seeds)
+		r.coordinateMigrations()
 	}
 
 	wake(r.pullWake)
@@ -180,6 +200,26 @@ func (r *Replicator) triggerSnapshotResync(from *member) {
 	if !r.resyncInFlight.CompareAndSwap(false, true) {
 		return
 	}
+
+	// restart-copy strategy: don't crawl the whole database row by row -
+	// flag the node and let the next process start install a full copy
+	// (rescuing local unsynced writes first).
+	if r.cfg.ResyncStrategy == "restart-copy" {
+		defer r.resyncInFlight.Store(false)
+		if pending, _ := getState(r.app.DB(), stateResyncPending); pending != "" {
+			return // already flagged; waiting for the restart
+		}
+		if err := setState(r.app.NonconcurrentDB(), stateResyncPending, nowStr()); err != nil {
+			r.logError("flagging resync_pending", err)
+			return
+		}
+		r.logMilestone("peer compacted past our cursor - full copy scheduled; RESTART THIS NODE to perform it",
+			"peer", from.NodeID)
+		r.emitEvent(EventSyncStarted, "full-copy resync scheduled - restart this node to perform it",
+			"peer", from.NodeID)
+		return
+	}
+
 	go func() {
 		defer r.resyncInFlight.Store(false)
 		r.logMilestone("peer compacted past our cursor - starting snapshot resync", "peer", from.NodeID)
@@ -237,6 +277,30 @@ type syncProgress struct {
 	start    time.Time     // sync start
 	lastLog  time.Time     // last time an ETA line was persisted
 	logEvery time.Duration // min interval between persisted ETA lines
+	phase    SyncPhase     // published to the live SyncStatus
+	peer     string        // node the data comes from
+}
+
+// publishSnapshotProgress mirrors the snapshot loop's progress into the
+// live SyncStatus consumed by the dashboard and the exported API.
+func (r *Replicator) publishSnapshotProgress(p *syncProgress, collection string) {
+	if p == nil {
+		return
+	}
+	phase := p.phase
+	if phase == "" {
+		phase = SyncSnapshotting
+	}
+	r.publishProgress(SyncStatus{
+		Phase:      phase,
+		Peer:       p.peer,
+		Collection: collection,
+		DoneRows:   p.done,
+		TotalRows:  p.total,
+		Percent:    p.percent(),
+		ETA:        p.etaRemaining(),
+		StartedAt:  p.start,
+	})
 }
 
 // etaRemaining estimates the time left based on the average row rate so
@@ -319,6 +383,14 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 	}
 	r.mergeMembers(meta.Members)
 
+	r.emitEvent(EventSnapshotStarted, "logical snapshot sync started",
+		"peer", meta.NodeID, "reconcile", reconcile)
+	snapOK := false
+	defer func() {
+		r.emitEvent(EventSnapshotFinished, "logical snapshot sync finished",
+			"peer", meta.NodeID, "ok", snapOK)
+	}()
+
 	// 1. schema first
 	for _, raw := range meta.Collections {
 		var probe struct {
@@ -351,34 +423,54 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 	// total expected rows across replicated collections, for ETA. When
 	// the peer is too old to report counts (meta.Counts == nil) this
 	// stays 0 and no ETA is shown.
-	prog := &syncProgress{start: time.Now(), logEvery: 15 * time.Second}
+	prog := &syncProgress{
+		start:    time.Now(),
+		logEvery: 15 * time.Second,
+		phase:    SyncSnapshotting,
+		peer:     meta.NodeID,
+	}
+	if reconcile {
+		prog.phase = SyncResyncing
+	}
 	for _, col := range cols {
 		if r.isReplicated(col) {
 			prog.total += meta.Counts[col.Name]
 		}
 	}
+	r.publishSnapshotProgress(prog, "")
+	defer r.clearProgress()
 	if prog.total > 0 {
 		r.logMilestone("estimating full sync duration", "rows_to_sync", prog.total)
 	}
+
+	// resume bookkeeping: an interrupted snapshot (process restart,
+	// peer outage) continues from the persisted per-collection cursors
+	// instead of re-paging everything
+	run := r.loadOrStartSnapshotResume(meta.NodeID, reconcile)
 
 	stats := &migrationStats{}
 	for _, col := range cols {
 		if !r.isReplicated(col) {
 			continue
 		}
-		seen, rows, err := r.snapshotCollection(baseURL, meta.NodeID, col, prog)
-		if err != nil {
-			// skip this collection (anti-entropy will still converge it);
-			// crucially, do NOT reconcile against an incomplete seen-set
-			r.logError("snapshot collection "+col.Name+" (skipped)", err)
-			continue
+		if run.Cols[col.Name] != snapshotColDone {
+			rows, err := r.snapshotCollection(baseURL, meta.NodeID, col, prog, run)
+			if err != nil {
+				// skip this collection (anti-entropy will still converge it);
+				// crucially, do NOT reconcile against an incomplete seen-set
+				r.logError("snapshot collection "+col.Name+" (skipped)", err, "collection", col.Name)
+				continue
+			}
+			stats.add(col.Name, rows)
 		}
-		stats.add(col.Name, rows)
 		if reconcile {
-			r.reconcileCollection(col, seen, meta.HorizonHLC)
+			r.reconcileCollection(col, run.RunID, meta.HorizonHLC)
 		}
 	}
 	stats.elapsed = time.Since(prog.start)
+
+	// the run is complete - drop the resume state and its seen-set
+	r.clearSnapshotResume(run)
 
 	// 3. adopt the peer's vector (captured BEFORE the record paging, so
 	// anything written meanwhile is replayed afterwards - idempotent)
@@ -395,17 +487,86 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 		}
 	}
 
+	snapOK = true
+	r.scheduleIntegrityCheck()
 	return &meta, stats, nil
 }
 
+// snapshotResume is the persisted progress of a logical snapshot run
+// (state key stateSnapshotResume) so an interrupted run continues after
+// a process restart instead of re-transferring everything.
+type snapshotResume struct {
+	RunID     string            `json:"run_id"`
+	PeerNode  string            `json:"peer_node"`
+	Reconcile bool              `json:"reconcile"`
+	Started   string            `json:"started"`
+	Cols      map[string]string `json:"cols"` // name -> after-cursor | snapshotColDone
+}
+
+// snapshotColDone marks a fully transferred collection in the resume state.
+const snapshotColDone = "@done"
+
+// maxSnapshotResumeAge bounds how old an interrupted run may be before
+// it is restarted from scratch instead of resumed.
+const maxSnapshotResumeAge = 24 * time.Hour
+
+// loadOrStartSnapshotResume returns the resume state of a matching
+// interrupted run, or starts (and persists) a fresh one.
+func (r *Replicator) loadOrStartSnapshotResume(peerNode string, reconcile bool) *snapshotResume {
+	db := r.app.NonconcurrentDB()
+
+	if raw, err := getState(db, stateSnapshotResume); err == nil && raw != "" {
+		var run snapshotResume
+		if err := json.Unmarshal([]byte(raw), &run); err == nil &&
+			run.RunID != "" && run.PeerNode == peerNode && run.Reconcile == reconcile {
+			if started, err := time.Parse(time.RFC3339, run.Started); err == nil &&
+				time.Since(started) < maxSnapshotResumeAge {
+				if run.Cols == nil {
+					run.Cols = map[string]string{}
+				}
+				r.logMilestone("resuming interrupted snapshot sync",
+					"peer", peerNode, "collections_done", len(run.Cols))
+				return &run
+			}
+		}
+	}
+
+	// fresh run: any leftover seen-set rows belong to abandoned runs
+	_ = deleteSyncSeen(db, "")
+	run := &snapshotResume{
+		RunID:     security.RandomString(10),
+		PeerNode:  peerNode,
+		Reconcile: reconcile,
+		Started:   nowStr(),
+		Cols:      map[string]string{},
+	}
+	r.saveSnapshotResume(run)
+	return run
+}
+
+func (r *Replicator) saveSnapshotResume(run *snapshotResume) {
+	b, err := json.Marshal(run)
+	if err != nil {
+		return
+	}
+	_ = setState(r.app.NonconcurrentDB(), stateSnapshotResume, string(b))
+}
+
+func (r *Replicator) clearSnapshotResume(run *snapshotResume) {
+	db := r.app.NonconcurrentDB()
+	_ = setState(db, stateSnapshotResume, "")
+	_ = deleteSyncSeen(db, run.RunID)
+}
+
 // snapshotCollection pages all records of one collection from the peer
-// and applies each through the LWW apply path. Returns the set of
-// record ids present on the peer and the number of rows migrated
-// (successfully applied) into this node. It prints live progress to the
-// console as pages arrive.
-func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Collection, prog *syncProgress) (map[string]bool, int, error) {
-	seen := map[string]bool{}
-	after := ""
+// and applies them in batched transactions through the LWW gate.
+// Returns the number of rows migrated (successfully applied) into this
+// node. Page cursors are persisted into the resume state, and when the
+// run reconciles, every id present on the peer is recorded in the
+// persistent seen-set. It prints live progress to the console as pages
+// arrive.
+func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Collection, prog *syncProgress, run *snapshotResume) (int, error) {
+	after := run.Cols[col.Name]
 	migrated := 0
 
 	for {
@@ -415,9 +576,12 @@ func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Coll
 		var page snapshotRecordsPage
 		if err := r.callPeer(baseURL, http.MethodGet, path, nil, &page); err != nil {
 			r.consoleProgressDone("migrating %q: interrupted after %d rows", col.Name, migrated)
-			return seen, migrated, err
+			return migrated, err
 		}
 
+		// build the page's ops (and its id list for the seen-set)
+		ops := make([]*op, 0, len(page.Items))
+		ids := make([]string, 0, len(page.Items))
 		for _, item := range page.Items {
 			var probe struct {
 				ID string `json:"id"`
@@ -425,7 +589,7 @@ func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Coll
 			if err := json.Unmarshal(item.Payload, &probe); err != nil || probe.ID == "" {
 				continue
 			}
-			seen[probe.ID] = true
+			ids = append(ids, probe.ID)
 
 			src := item.SrcNode
 			if src == "" {
@@ -448,17 +612,43 @@ func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Coll
 			if o.SrcNode == r.nodeID {
 				continue // our own record state; we already have it
 			}
-			if err := r.applyRecordOp(o); err != nil {
-				r.stats.failed.Add(1)
-				r.logError("snapshot: apply record "+col.Name+"/"+probe.ID, err)
+			// cheap LWW pre-check so resumed/replayed pages skip records
+			// that are already current without opening a write tx
+			if cur, err := getVersion(r.app.DB(), o.ColID, o.RecordID); err == nil && !supersedes(o, cur) {
 				continue
 			}
-			migrated++
+			// blob IO must happen outside the batch write transaction
+			if len(o.Files) > 0 {
+				r.fetchFilesForOp(o, col)
+			}
+			ops = append(ops, o)
+		}
+
+		if run.Reconcile && len(ids) > 0 {
+			if err := insertSyncSeen(r.app.NonconcurrentDB(), run.RunID, col.Id, ids); err != nil {
+				return migrated, err
+			}
+		}
+
+		if n, err := r.applySnapshotBatch(col, ops); err == nil {
+			migrated += n
+		} else {
+			// one bad row shouldn't sink the page: fall back to the
+			// per-record path and count individual failures
+			for _, o := range ops {
+				if err := r.applyRecordOp(o); err != nil {
+					r.stats.failed.Add(1)
+					r.logError("snapshot: apply record "+col.Name+"/"+o.RecordID, err, "collection", col.Name)
+					continue
+				}
+				migrated++
+			}
 		}
 
 		// advance the overall counter and refresh the ETA
 		if prog != nil {
 			prog.done += int64(len(page.Items))
+			r.publishSnapshotProgress(prog, col.Name)
 		}
 
 		// live progress line, updated in place per page. Include the
@@ -473,48 +663,69 @@ func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Coll
 
 		if page.NextAfter == "" || len(page.Items) == 0 {
 			r.consoleProgressDone("migrated %q: %d rows", col.Name, migrated)
-			return seen, migrated, nil
+			run.Cols[col.Name] = snapshotColDone
+			r.saveSnapshotResume(run)
+			return migrated, nil
 		}
 		after = page.NextAfter
+		run.Cols[col.Name] = after
+		r.saveSnapshotResume(run)
 	}
 }
 
 // reconcileCollection deletes local records that don't exist on the
 // snapshot source anymore, unless they were written after the peer's
 // tombstone horizon (in which case they are legitimately newer local
-// writes that will replicate out normally).
-func (r *Replicator) reconcileCollection(col *core.Collection, seen map[string]bool, horizonHLC string) {
-	var ids []string
-	err := r.app.DB().NewQuery(fmt.Sprintf("SELECT id FROM {{%s}}", col.Name)).Column(&ids)
-	if err != nil {
-		r.logError("reconcile: list local records "+col.Name, err)
-		return
-	}
+// writes that will replicate out normally). Candidates are discovered
+// in keyset-paged batches against the persistent seen-set, so no
+// full-table id list is ever materialized in memory.
+func (r *Replicator) reconcileCollection(col *core.Collection, runID, horizonHLC string) {
+	const pageSize = 1000
+	after := ""
 
-	for _, id := range ids {
-		if seen[id] {
-			continue
-		}
-		ver, err := getVersion(r.app.DB(), col.Id, id)
+	for {
+		var ids []string
+		err := r.app.DB().NewQuery(fmt.Sprintf(
+			`SELECT id FROM {{%s}} WHERE id > {:after} AND id NOT IN (
+				SELECT id FROM _repl_sync_seen WHERE run_id = {:run} AND col_id = {:cid})
+			ORDER BY id LIMIT {:l}`, col.Name)).
+			Bind(dbx.Params{"after": after, "run": runID, "cid": col.Id, "l": pageSize}).
+			Column(&ids)
 		if err != nil {
-			continue
+			r.logError("reconcile: list local records "+col.Name, err, "collection", col.Name)
+			return
 		}
-		// keep records written after the horizon - they're newer local
-		// writes, not resurrections
-		if ver != nil && horizonHLC != "" && ver.HLC >= horizonHLC {
-			continue
+		if len(ids) == 0 {
+			return
+		}
+		after = ids[len(ids)-1]
+
+		for _, id := range ids {
+			ver, err := getVersion(r.app.DB(), col.Id, id)
+			if err != nil {
+				continue
+			}
+			// keep records written after the horizon - they're newer local
+			// writes, not resurrections
+			if ver != nil && horizonHLC != "" && ver.HLC >= horizonHLC {
+				continue
+			}
+
+			o := &op{
+				SrcNode:  "snapshot-reconcile",
+				HLC:      r.clock.Now(),
+				Type:     opDelete,
+				ColID:    col.Id,
+				ColName:  col.Name,
+				RecordID: id,
+			}
+			if err := r.applyReconcileDelete(col, o); err != nil {
+				r.logError("reconcile: delete "+col.Name+"/"+id, err, "collection", col.Name)
+			}
 		}
 
-		o := &op{
-			SrcNode:  "snapshot-reconcile",
-			HLC:      r.clock.Now(),
-			Type:     opDelete,
-			ColID:    col.Id,
-			ColName:  col.Name,
-			RecordID: id,
-		}
-		if err := r.applyReconcileDelete(col, o); err != nil {
-			r.logError("reconcile: delete "+col.Name+"/"+id, err)
+		if len(ids) < pageSize {
+			return
 		}
 	}
 }

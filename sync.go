@@ -225,6 +225,7 @@ func (r *Replicator) pushToPeer(p *member, memberList []*member) {
 			return // anti-entropy will heal
 		}
 		r.clearPeerErr(p.NodeID)
+		r.notePeerVector(p.NodeID, resp.Vector)
 
 		cursor = last
 		r.cursorMu.Lock()
@@ -285,12 +286,114 @@ func (r *Replicator) syncRound() {
 		r.clearPeerErr(m.NodeID)
 	}
 
+	r.detectHealthTransitions(members)
+	r.maybeLogLagSummary()
+
 	r.retryPending()
 	r.retryMissingBlobs()
+	r.maybeBackfillBlobs()
+	r.maybeRunIntegrity()
 	r.flushClients()
 
 	// periodically persist the clock so restarts resume monotonically
 	_ = setState(r.app.NonconcurrentDB(), stateHLC, r.clock.Current())
+}
+
+// detectHealthTransitions compares each member's current health with
+// the previously observed state and logs + emits an event on every
+// flip, so outages and recoveries are visible in the logs and on the
+// event timeline (the dashboard only shows the live state).
+func (r *Replicator) detectHealthTransitions(members []*member) {
+	r.healthMu.Lock()
+	defer r.healthMu.Unlock()
+
+	seen := map[string]bool{}
+	for _, m := range members {
+		if m.NodeID == r.nodeID {
+			continue
+		}
+		seen[m.NodeID] = true
+		cur := r.isHealthy(m)
+		prev, known := r.prevHealth[m.NodeID]
+		r.prevHealth[m.NodeID] = cur
+		if !known || cur == prev {
+			continue
+		}
+		if cur {
+			r.logMilestone("peer is healthy again", "peer", m.NodeID)
+			r.emitEvent(EventPeerHealthy, "peer is healthy again", "peer", m.NodeID)
+		} else {
+			errMsg := ""
+			if v, ok := r.memberErrs.Load(m.NodeID); ok {
+				errMsg, _ = v.(string)
+			}
+			r.logMilestone("peer became unhealthy", "peer", m.NodeID, "last_error", errMsg)
+			r.emitEvent(EventPeerUnhealthy, "peer became unhealthy", "peer", m.NodeID, "last_error", errMsg)
+		}
+	}
+	// forget nodes that left the member list
+	for id := range r.prevHealth {
+		if !seen[id] {
+			delete(r.prevHealth, id)
+		}
+	}
+}
+
+// notePeerVector records the vector a peer reported in a push or pull
+// response; the basis for lag computation.
+func (r *Replicator) notePeerVector(nodeID string, vec map[string]int64) {
+	if nodeID == "" || vec == nil {
+		return
+	}
+	r.peerVectors.Store(nodeID, vec)
+}
+
+// peerLag returns how many of THIS node's ops the given peer has not
+// acknowledged yet (-1 when unknown, i.e. no exchange happened yet).
+func (r *Replicator) peerLag(nodeID string) int64 {
+	v, ok := r.peerVectors.Load(nodeID)
+	if !ok {
+		return -1
+	}
+	vec, _ := v.(map[string]int64)
+	if vec == nil {
+		return -1
+	}
+	localSeq, err := getState(r.app.DB(), stateLocalSeq)
+	if err != nil {
+		return -1
+	}
+	var seq int64
+	if localSeq != "" {
+		fmt.Sscanf(localSeq, "%d", &seq)
+	}
+	lag := seq - vec[r.nodeID]
+	if lag < 0 {
+		lag = 0
+	}
+	return lag
+}
+
+// maybeLogLagSummary logs a periodic per-peer replication lag summary
+// (roughly once a minute, piggybacking on the sync round).
+func (r *Replicator) maybeLogLagSummary() {
+	const period = 60 // seconds
+	now := time.Now().Unix()
+	last := r.lastLagLog.Load()
+	if now-last < period || !r.lastLagLog.CompareAndSwap(last, now) {
+		return
+	}
+	args := []any{}
+	r.peerVectors.Range(func(k, _ any) bool {
+		id, _ := k.(string)
+		if lag := r.peerLag(id); lag >= 0 {
+			args = append(args, "lag_"+id, lag)
+		}
+		return true
+	})
+	if len(args) > 0 {
+		r.logInfo("replication lag summary (ops not yet acknowledged per peer)", args...)
+	}
 }
 
 func (r *Replicator) pullFromPeer(m *member) error {
@@ -313,6 +416,7 @@ func (r *Replicator) pullFromPeer(m *member) error {
 
 		_ = touchMember(r.app.NonconcurrentDB(), m.NodeID)
 		r.mergeMembers(resp.Members)
+		r.notePeerVector(m.NodeID, resp.Vector)
 
 		if resp.SnapshotRequired {
 			if pulled > 0 {

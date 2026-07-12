@@ -2,6 +2,7 @@ package pbreplication
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
@@ -22,9 +23,15 @@ func (r *Replicator) registerRoutes(se *core.ServeEvent) {
 	n.GET("/file/{collection}/{recordId}/{filename}", r.handleFile)
 	n.GET("/snapshot/meta", r.serveSnapshotMeta)
 	n.GET("/snapshot/records", r.serveSnapshotRecords)
+	n.POST("/snapshot/db", r.handleDBSnapshotPrepare)
+	n.GET("/snapshot/db/chunk", r.handleDBSnapshotChunk)
+	n.GET("/migrations", r.handleMigrations)
 
 	// --- admin endpoints ---
 	g.GET("/status", r.handleStatus).Bind(apis.RequireSuperuserAuth())
+	g.GET("/events", r.handleEvents).Bind(apis.RequireSuperuserAuth())
+	g.GET("/integrity", r.handleIntegrity).Bind(apis.RequireSuperuserAuth())
+	g.POST("/integrity/run", r.handleIntegrityRun).Bind(apis.RequireSuperuserAuth())
 	g.GET("/firewall/summary", r.handleFirewallSummary).Bind(apis.RequireSuperuserAuth())
 	g.GET("/clients", r.handleClients).Bind(apis.RequireSuperuserAuth())
 	g.GET("/clients/detail", r.handleClientDetail).Bind(apis.RequireSuperuserAuth())
@@ -72,7 +79,11 @@ func (r *Replicator) handleJoin(e *core.RequestEvent) error {
 		return e.InternalServerError("failed to compute vector", nil)
 	}
 
-	r.logInfo("node joined", "node", req.NodeID, "url", req.URL, "reachable", reachable)
+	r.logInfo("node joined", "peer", req.NodeID, "url", req.URL, "reachable", reachable)
+	if req.NodeID != r.nodeID {
+		r.emitEvent(EventNodeJoined, "node joined the cluster",
+			"peer", req.NodeID, "url", req.URL, "reachable", reachable)
+	}
 
 	return e.JSON(http.StatusOK, &joinResponse{
 		NodeID:      r.nodeID,
@@ -175,6 +186,30 @@ func (r *Replicator) noteSender(s senderInfo) {
 		cur.Reachable = true
 	}
 	_ = upsertMember(db, cur)
+}
+
+// handleMigrations reports which migration files this node has
+// executed, so starting peers can coordinate instead of re-running
+// migrations whose effects already replicated.
+func (r *Replicator) handleMigrations(e *core.RequestEvent) error {
+	applied, err := listAppliedMigrations(r.app.DB())
+	if err != nil {
+		return e.InternalServerError("failed to list migrations", nil)
+	}
+	return e.JSON(http.StatusOK, &migrationsResponse{NodeID: r.nodeID, Applied: applied})
+}
+
+// handleEvents serves the replication event timeline, newest first.
+func (r *Replicator) handleEvents(e *core.RequestEvent) error {
+	limit := 200
+	if v := e.Request.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	return e.JSON(http.StatusOK, map[string]any{
+		"events": r.Events(limit),
+	})
 }
 
 // handleFile streams a stored record file to a peer.

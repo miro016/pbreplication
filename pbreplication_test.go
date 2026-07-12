@@ -746,8 +746,10 @@ func TestDeferAppMigrationsDecision(t *testing.T) {
 		}
 	})
 
-	// already bootstrapped: untouched
-	t.Run("already bootstrapped", func(t *testing.T) {
+	// already bootstrapped WITH a cluster: still deferred, so new
+	// migrations after an upgrade coordinate with peers instead of
+	// re-running (duplicate-seed hazard)
+	t.Run("already bootstrapped clustered", func(t *testing.T) {
 		stashAppMigrations(t)
 		app := newTestAppOnly(t)
 		if err := createTables(app); err != nil {
@@ -762,8 +764,30 @@ func TestDeferAppMigrationsDecision(t *testing.T) {
 			SeedURL:       "http://seed.test:8090",
 			ClusterSecret: testSecret,
 		})
-		if len(core.AppMigrations.Items()) != 2 || r.migrationsDeferred {
-			t.Fatal("migrations must not be deferred after bootstrap_done")
+		if len(core.AppMigrations.Items()) != 0 || !r.migrationsDeferred {
+			t.Fatal("clustered nodes must defer migrations on every start")
+		}
+	})
+
+	// already bootstrapped, no seed, but known peers: also deferred
+	t.Run("bootstrapped seedless with peers", func(t *testing.T) {
+		stashAppMigrations(t)
+		app := newTestAppOnly(t)
+		if err := createTables(app); err != nil {
+			t.Fatal(err)
+		}
+		if err := upsertMember(app.NonconcurrentDB(), &member{
+			NodeID: "nodeB0000000002", URL: "http://b.test", LastSeen: nowStr(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		register2()
+		r := newTestNodeCfg(t, app, Config{
+			NodeID:        "nodeA0000000001",
+			ClusterSecret: testSecret,
+		})
+		if len(core.AppMigrations.Items()) != 0 || !r.migrationsDeferred {
+			t.Fatal("a seed node with known peers must defer for coordination")
 		}
 	})
 

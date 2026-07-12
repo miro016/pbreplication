@@ -21,11 +21,14 @@
 package pbreplication
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +37,18 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/security"
 )
+
+// newPeerTransport builds the shared HTTP transport for node-to-node
+// calls: bounded dial and response-header phases, but no overall
+// request timeout (per-call deadlines come from contexts).
+func newPeerTransport() *http.Transport {
+	return &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+}
 
 // Config configures a cluster node.
 type Config struct {
@@ -115,6 +130,68 @@ type Config struct {
 	// geolocation uses the HTTPS pro endpoint (higher rate limit, no
 	// public-network throttling). When empty the free endpoint is used.
 	IPAPIKey string
+
+	// RequestTimeout bounds a single node-to-node JSON request
+	// (push/pull/join/meta pages). Streaming transfers (blobs, database
+	// snapshot chunks) are NOT subject to it; they use per-chunk
+	// deadlines instead so large transfers survive slow links.
+	// Default: 30s.
+	RequestTimeout time.Duration
+
+	// MaxBodyBytes caps how much of a node-to-node request body is
+	// buffered in memory for HMAC verification. Push/pull payloads are
+	// already bounded by MaxBatch, so the default is generous.
+	// Default: 16MB.
+	MaxBodyBytes int64
+
+	// EventBufferSize is the capacity of the in-memory replication
+	// event ring buffer served at /api/replication/events and via
+	// (*Replicator).Events. Default: 512.
+	EventBufferSize int
+
+	// FullCopyBootstrap makes a NEW node (no local database yet) copy
+	// the seed's whole SQLite database file instead of syncing row by
+	// row - orders of magnitude faster for large databases. The copy
+	// happens BEFORE PocketBase opens the database, so serve-time
+	// migrations run only the files the cluster hasn't applied and the
+	// node starts already in sync. Old seeds without snapshot support
+	// fall back to the logical sync automatically. Default: true.
+	FullCopyBootstrap *bool
+
+	// FullCopyChunkSize is the transfer chunk for database snapshot
+	// downloads. Each chunk is fetched (and retried) independently, so
+	// unstable links resume instead of restarting. Default: 8MB.
+	FullCopyChunkSize int
+
+	// FullCopyFallbackAfter bounds how long a failing full copy is
+	// retried before the node falls back to the logical bootstrap.
+	// Default: 10m.
+	FullCopyFallbackAfter time.Duration
+
+	// SnapshotCacheTTL is how long a prepared database snapshot file is
+	// reused for additional joiners before a fresh one is vacuumed.
+	// Default: 10m.
+	SnapshotCacheTTL time.Duration
+
+	// IntegrityCheckAfterSync runs a relation-integrity validation pass
+	// (dangling reference scan) after bulk syncs complete, re-checking
+	// while the node converges. Results surface in the logs, the event
+	// timeline, /status and LastIntegrityReport(). Default: true.
+	IntegrityCheckAfterSync *bool
+
+	// MigrationCoordinationTimeout bounds how long a starting node waits
+	// for peers to report their executed migrations before falling back
+	// to running the deferred migrations locally. Default: 30s.
+	MigrationCoordinationTimeout time.Duration
+
+	// ResyncStrategy selects how a node that fell behind compaction
+	// (snapshot_required) catches up:
+	//   "logical"      - row-by-row snapshot sync in-process (default)
+	//   "restart-copy" - flag the node (resync_pending) and ask for a
+	//                    restart; the next start replaces the database
+	//                    with a full copy, rescuing un-synced local
+	//                    writes first. Best for very large databases.
+	ResyncStrategy string
 }
 
 func (c *Config) setDefaults() {
@@ -148,6 +225,38 @@ func (c *Config) setDefaults() {
 		v := true
 		c.FirewallExemptSuperusers = &v
 	}
+	if c.RequestTimeout <= 0 {
+		c.RequestTimeout = 30 * time.Second
+	}
+	if c.MaxBodyBytes <= 0 {
+		c.MaxBodyBytes = 16 << 20
+	}
+	if c.EventBufferSize <= 0 {
+		c.EventBufferSize = 512
+	}
+	if c.FullCopyBootstrap == nil {
+		v := true
+		c.FullCopyBootstrap = &v
+	}
+	if c.FullCopyChunkSize <= 0 {
+		c.FullCopyChunkSize = 8 << 20
+	}
+	if c.FullCopyFallbackAfter <= 0 {
+		c.FullCopyFallbackAfter = 10 * time.Minute
+	}
+	if c.SnapshotCacheTTL <= 0 {
+		c.SnapshotCacheTTL = 10 * time.Minute
+	}
+	if c.IntegrityCheckAfterSync == nil {
+		v := true
+		c.IntegrityCheckAfterSync = &v
+	}
+	if c.MigrationCoordinationTimeout <= 0 {
+		c.MigrationCoordinationTimeout = 30 * time.Second
+	}
+	if c.ResyncStrategy == "" {
+		c.ResyncStrategy = "logical"
+	}
 	c.NodeURL = strings.TrimRight(c.NodeURL, "/")
 	c.SeedURL = strings.TrimRight(c.SeedURL, "/")
 }
@@ -155,6 +264,9 @@ func (c *Config) setDefaults() {
 func (c *Config) validate() error {
 	if len(c.ClusterSecret) < 16 {
 		return errors.New("pbreplication: ClusterSecret must be at least 16 characters")
+	}
+	if c.ResyncStrategy != "logical" && c.ResyncStrategy != "restart-copy" {
+		return fmt.Errorf("pbreplication: invalid ResyncStrategy %q (want \"logical\" or \"restart-copy\")", c.ResyncStrategy)
 	}
 	return nil
 }
@@ -168,7 +280,18 @@ type Replicator struct {
 	nodeID string
 	ready  atomic.Bool
 
-	client *http.Client
+	// jsonClient serves bounded request/response exchanges; each call
+	// carries its own context deadline (cfg.RequestTimeout). streamClient
+	// has no overall timeout so long-running streams (blobs, database
+	// snapshot chunks) are not killed mid-transfer; it still bounds the
+	// dial and response-header phases.
+	jsonClient   *http.Client
+	streamClient *http.Client
+
+	// runCtx is cancelled on shutdown; all outgoing peer requests are
+	// derived from it.
+	runCtx    context.Context
+	runCancel context.CancelFunc
 
 	pushWake chan struct{}
 	pullWake chan struct{}
@@ -195,6 +318,27 @@ type Replicator struct {
 	// last sync error per peer (empty entry = healthy), for the dashboard
 	memberErrs sync.Map // nodeID -> string
 
+	// replication event timeline (ring buffer + subscribers)
+	events *eventLog
+
+	// live bulk-sync progress (snapshot / full copy / integrity check)
+	progressState atomic.Pointer[SyncStatus]
+
+	// last observed health per peer, for transition detection
+	healthMu   sync.Mutex
+	prevHealth map[string]bool
+
+	// most recent vector reported by each peer (from push/pull
+	// responses); the basis for replication-lag reporting
+	peerVectors sync.Map // nodeID -> map[string]int64
+
+	// last time the periodic lag summary was logged
+	lastLagLog atomic.Int64 // unix seconds
+
+	// throttle for op-failure events (per collection)
+	opFailMu   sync.Mutex
+	opFailLast map[string]time.Time
+
 	// buffered per-client-IP request counters (flushed in batches)
 	clientCounts sync.Map // ip -> *clientCounter
 	// buffered per-(ip,method,path) counters
@@ -211,6 +355,19 @@ type Replicator struct {
 
 	// guards concurrent snapshot resyncs
 	resyncInFlight atomic.Bool
+
+	// prepared database snapshot cache (server side of the full copy)
+	dbSnapMu       sync.Mutex
+	dbSnapManifest *dbSnapshotManifest
+	dbSnapCreated  time.Time
+
+	// guards concurrent blob backfill passes
+	blobBackfillInFlight atomic.Bool
+
+	// relation-integrity validation state
+	integrityPending  atomic.Bool
+	integrityInFlight atomic.Bool
+	lastIntegrity     atomic.Pointer[IntegrityReport]
 
 	// app migrations held back until after the initial snapshot sync.
 	// Written once in initStorage (before apis.Serve/startBackground),
@@ -238,17 +395,31 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 		return nil, err
 	}
 
+	runCtx, runCancel := context.WithCancel(context.Background())
 	r := &Replicator{
-		app:         app,
-		cfg:         cfg,
-		clock:       newHLC(),
-		client:      &http.Client{Timeout: 30 * time.Second},
+		app:   app,
+		cfg:   cfg,
+		clock: newHLC(),
+		jsonClient: &http.Client{
+			// no flat Timeout: every call sets a context deadline
+			Transport: newPeerTransport(),
+		},
+		streamClient: &http.Client{
+			// no overall timeout: streams are bounded per chunk by the
+			// caller; the transport still bounds dial + header phases
+			Transport: newPeerTransport(),
+		},
+		runCtx:      runCtx,
+		runCancel:   runCancel,
 		pushWake:    make(chan struct{}, 1),
 		pullWake:    make(chan struct{}, 1),
 		applyCh:     make(chan *op, 4096),
 		stopCh:      make(chan struct{}),
 		pushCursors: map[string]int64{},
 		excluded:    map[string]bool{},
+		events:      newEventLog(cfg.EventBufferSize),
+		prevHealth:  map[string]bool{},
+		opFailLast:  map[string]time.Time{},
 	}
 	for _, name := range cfg.ExcludeCollections {
 		r.excluded[name] = true
@@ -259,6 +430,13 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 	r.firewall = newFirewall(r)
 
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
+		// BEFORE PocketBase opens its database: a new node (or one
+		// flagged for resync) installs a full copy of the cluster's
+		// database first, so PB boots directly on synced data and
+		// serve-time migrations run only what the cluster hasn't.
+		if err := r.maybeFullCopyBootstrap(e.App); err != nil {
+			return err
+		}
 		if err := e.Next(); err != nil {
 			return err
 		}
@@ -405,6 +583,7 @@ func (r *Replicator) startBackground() {
 func (r *Replicator) shutdown() {
 	r.stopOnce.Do(func() {
 		close(r.stopCh)
+		r.runCancel()
 	})
 	r.wg.Wait()
 	if r.nodeID != "" {
@@ -412,6 +591,10 @@ func (r *Replicator) shutdown() {
 	}
 	if r.firewall != nil {
 		r.firewall.close()
+	}
+	// prepared snapshot files are cheap to regenerate - don't keep them
+	if r.app != nil && r.app.DataDir() != "" {
+		_ = os.RemoveAll(filepath.Join(r.app.DataDir(), dbSnapshotDir))
 	}
 }
 
@@ -424,17 +607,31 @@ func (r *Replicator) isReplicated(col *core.Collection) bool {
 	return !r.excluded[col.Name] && !r.excluded[col.Id]
 }
 
-func (r *Replicator) logError(msg string, err error) {
-	r.stats.lastError.Store(fmt.Sprintf("%s: %v", msg, err))
-	if r.app != nil && r.app.Logger() != nil {
-		r.app.Logger().Error("pbreplication: "+msg, slog.String("error", err.Error()))
+// log routes a message to the PocketBase logger with the standard
+// component attribute prepended, so replication entries are filterable
+// in the _logs table.
+func (r *Replicator) log(level slog.Level, msg string, args ...any) {
+	if r.app == nil || r.app.Logger() == nil {
+		return
 	}
+	all := make([]any, 0, len(args)+2)
+	all = append(all, slog.String("component", "pbreplication"))
+	all = append(all, args...)
+	r.app.Logger().Log(context.Background(), level, "pbreplication: "+msg, all...)
+}
+
+func (r *Replicator) logError(msg string, err error, args ...any) {
+	r.stats.lastError.Store(fmt.Sprintf("%s: %v", msg, err))
+	all := append([]any{slog.String("error", err.Error())}, args...)
+	r.log(slog.LevelError, msg, all...)
+}
+
+func (r *Replicator) logWarn(msg string, args ...any) {
+	r.log(slog.LevelWarn, msg, args...)
 }
 
 func (r *Replicator) logInfo(msg string, args ...any) {
-	if r.app != nil && r.app.Logger() != nil {
-		r.app.Logger().Info("pbreplication: "+msg, args...)
-	}
+	r.log(slog.LevelInfo, msg, args...)
 }
 
 // logMilestone records a notable lifecycle event (instance connected,

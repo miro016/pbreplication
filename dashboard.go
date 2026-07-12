@@ -28,6 +28,8 @@ type statusResponse struct {
 	Applied      int64            `json:"applied_total"`
 	Failed       int64            `json:"failed_total"`
 	Blocked      int64            `json:"blocked_total"`
+	Sync         SyncStatus       `json:"sync"`
+	Integrity    *IntegrityReport `json:"integrity,omitempty"`
 	LastError    string           `json:"last_error,omitempty"`
 }
 
@@ -40,6 +42,7 @@ type memberStatus struct {
 	JoinedAt  string `json:"joined_at"`
 	LastSeen  string `json:"last_seen"`
 	Applied   int64  `json:"applied_seq"` // our vector entry for this node
+	LagOps    int64  `json:"lag_ops"`     // our ops the peer hasn't acked (-1 unknown)
 	LastError string `json:"last_error,omitempty"`
 }
 
@@ -73,6 +76,8 @@ func (r *Replicator) handleStatus(e *core.RequestEvent) error {
 		Applied:      r.stats.applied.Load(),
 		Failed:       r.stats.failed.Load(),
 		Blocked:      r.stats.blocked.Load(),
+		Sync:         r.SyncStatus(),
+		Integrity:    r.LastIntegrityReport(),
 	}
 	if v := r.stats.lastError.Load(); v != nil {
 		resp.LastError, _ = v.(string)
@@ -88,6 +93,12 @@ func (r *Replicator) handleStatus(e *core.RequestEvent) error {
 			JoinedAt:  m.JoinedAt,
 			LastSeen:  m.LastSeen,
 			Applied:   vector[m.NodeID],
+			LagOps:    -1,
+		}
+		if m.NodeID == r.nodeID {
+			ms.LagOps = 0
+		} else if lag := r.peerLag(m.NodeID); lag >= 0 {
+			ms.LagOps = lag
 		}
 		if v, ok := r.memberErrs.Load(m.NodeID); ok {
 			ms.LastError, _ = v.(string)

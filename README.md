@@ -42,16 +42,37 @@ after downtime) is discovered and handled automatically.
 - **Files replicate** — uploads are fetched from peers and stored under
   the same keys; protected file tokens work cluster-wide.
 - **Deletes propagate** via tombstones, and survive node downtime.
+- **Fast bootstrap: whole-database copy** — a brand-new node downloads
+  the seed's entire SQLite database as one consistent snapshot
+  (`VACUUM INTO`, chunked + resumable + checksummed) *before*
+  PocketBase even opens it, then pulls only the deltas. Orders of
+  magnitude faster than row-by-row sync for large databases; falls back
+  to the logical sync against older peers automatically.
 - **Nodes can join late or rejoin** — anti-entropy replays missed
-  operations; brand-new (or too-stale) nodes bootstrap with a full
-  snapshot, files included.
-- **Migrations are safe** — schema changes replicate as idempotent
-  operations; the same migration running on several nodes converges
-  (content-hash dedup + LWW). A fresh node joining a cluster doesn't
-  even run them: it syncs first and then runs only the migrations the
-  cluster hasn't applied yet.
+  operations; too-stale nodes resync with a logical snapshot (resumable
+  across restarts) or, with `ResyncStrategy: "restart-copy"`, a full
+  database copy that first **rescues local writes the cluster never
+  saw** and replays them afterwards.
+- **Migrations are safe & cluster-coordinated** — schema changes
+  replicate as idempotent operations; the same migration running on
+  several nodes converges (content-hash dedup + LWW). On every start a
+  clustered node first asks its peers which migrations already ran and
+  executes only the rest — so a data-seeding migration can never run
+  twice and collide with rows arriving via sync.
 - **Cluster dashboard** — `/api/replication/dashboard` shows every
-  node, its health, replication progress and errors.
+  node, its health, per-peer replication lag, live sync progress (with
+  ETA and MB/s during a database copy), the relation-integrity status
+  and a filterable event timeline.
+- **Observability built in** — a ring buffer of typed replication
+  events (`/api/replication/events`, node joins, health flips, sync
+  lifecycle, failed ops, firewall blocks…), structured logs
+  (`component=pbreplication`), periodic lag summaries, and an exported
+  Go API (`Status()`, `SyncStatus()`, `PeerLags()`, `Events()`,
+  `OnEvent()`, `RunIntegrityCheck()`…).
+- **Relation integrity validated** — replicated relations can never
+  fail to apply (they converge as ops arrive); after every bulk sync a
+  background pass verifies no dangling references remain and reports
+  via logs, events, `/status` and the Go API.
 - **Built-in firewall** — allow/deny rules by IP, CIDR range, country
   or region, managed from the dashboard, enforced on all routes with a
   separate scope for the replication endpoints. Rules replicate
@@ -103,7 +124,17 @@ docker compose up --build
 | `CompactionInterval` | `1h` | How often the oplog/bookkeeping garbage collection runs. |
 | `ExcludeCollections` | `_mfas, _otps, _authOrigins` | Collections that stay node-local. |
 | `ReplicateSuperusers` | `true` | Replicate the `_superusers` collection. |
-| `DeferMigrationsUntilSynced` | `true` | A fresh node joining a cluster postpones the app's migrations until after the initial snapshot sync, then runs only those the cluster hasn't applied (see below). |
+| `DeferMigrationsUntilSynced` | `true` | Clustered nodes postpone the app's migrations on every start and coordinate with peers, running only migrations no member has applied (see below). |
+| `RequestTimeout` | `30s` | Deadline for one node-to-node JSON request. Streaming transfers (files, database chunks) use per-chunk deadlines instead of one global timeout. |
+| `MaxBodyBytes` | `16MB` | Max node-to-node request body buffered for HMAC verification. |
+| `FullCopyBootstrap` | `true` | New nodes bootstrap by copying the seed's whole database file instead of row-by-row sync (see below). |
+| `FullCopyChunkSize` | `8MB` | Chunk size for database snapshot downloads (each chunk retried independently). |
+| `FullCopyFallbackAfter` | `10m` | How long a failing full copy is retried before falling back to the logical sync. |
+| `SnapshotCacheTTL` | `10m` | How long a prepared database snapshot is reused for additional joiners. |
+| `ResyncStrategy` | `"logical"` | How a node that fell behind compaction resyncs: `"logical"` (in-process row sync) or `"restart-copy"` (flag + full DB copy on next restart, rescuing local writes). |
+| `MigrationCoordinationTimeout` | `30s` | How long a starting node waits for peers to report executed migrations before running its deferred migrations locally. |
+| `IntegrityCheckAfterSync` | `true` | Run a relation-integrity scan (dangling reference check) after bulk syncs. |
+| `EventBufferSize` | `512` | Capacity of the in-memory replication event timeline. |
 | `DisableUIExtension` | `false` | Turn off the "Replication" tab injected into the admin UI. |
 | `GeoIPDBPath` | `""` | Path to a MaxMind-format `.mmdb` enabling country/region firewall rules. |
 | `FirewallExemptSuperusers` | `true` | Superuser-authenticated requests bypass app-scope firewall rules (lock-out guard). |
@@ -138,8 +169,17 @@ The dashboard is also available standalone at
 `GET /api/replication/dashboard` on any node (it picks up your admin UI
 login from the browser automatically). Two tabs:
 
-- **Nodes**: every member, its URL (or pull-only), health, replication
-  progress, oplog size, pending/failed operations.
+- **Nodes**: every member, its URL (or pull-only), health, applied
+  sequence and **replication lag** (how many of this node's operations
+  the peer hasn't acknowledged yet), oplog size, pending/failed
+  operations, and the last relation-integrity result. During a bulk
+  sync (initial sync, resync, database copy, blob backfill, integrity
+  check) a **live progress banner** shows the phase, percent, rows or
+  MB transferred and the ETA.
+- **Events**: the replication event timeline — node joins/removals,
+  peer health transitions, snapshot/copy start+finish, failed
+  operations, migration runs, firewall blocks and integrity reports,
+  filterable by type (backed by `GET /api/replication/events`).
 - **Firewall**: manage allow/deny rules, see per-scope mode
   (blacklist/whitelist), GeoIP status and the blocked-request counter.
 - **Map**: a world map of every unique client IP this node has seen —
@@ -162,8 +202,9 @@ Firewall country/region rules are picked from a multi-select in the
 dashboard (search by name; one rule is created per selection), and the
 IP/CIDR inputs show format-specific placeholders.
 
-Data endpoints (`/api/replication/status`,
-`/api/replication/firewall/summary`) require superuser auth.
+Data endpoints (`/api/replication/status`, `/api/replication/events`,
+`/api/replication/integrity`, `/api/replication/firewall/summary`)
+require superuser auth.
 
 ## Firewall
 
@@ -210,6 +251,84 @@ without creating replication loops. Old log entries are compacted away
 kept for `TombstoneRetention`), and nodes that fall behind the
 compaction horizon are automatically resynced from a full snapshot.
 
+## Fast bootstrap: the full database copy
+
+With `FullCopyBootstrap` (default on), a brand-new node joining a
+cluster doesn't crawl the seed row by row. The startup sequence is:
+
+1. **Before PocketBase opens its database**, the node asks the seed for
+   a database snapshot (`POST /api/replication/snapshot/db`). The seed
+   produces a consistent point-in-time copy with SQLite's `VACUUM INTO`
+   (WAL-safe, no partial state) and advertises its size, SHA-256, and
+   the replication vector captured *before* the vacuum. Snapshots are
+   cached for `SnapshotCacheTTL`, so ten joiners cost one vacuum.
+2. The file downloads in `FullCopyChunkSize` chunks — each chunk has
+   its own deadline and retry, transfers are gzip-compressed, and an
+   interrupted download **resumes at the exact byte offset** even
+   across process restarts. The finished file is verified against the
+   manifest checksum.
+3. The copy is rewritten as *this* node: fresh node identity, adopted
+   vector, cleared node-local telemetry, emptied `ExcludeCollections`.
+4. The file is atomically installed as `data.db`, PocketBase opens it,
+   and the serve-time migration runner executes **only the migration
+   files missing from the copied `_migrations` table** — the cluster's
+   migration history travels inside the copy.
+5. The node joins the cluster and the first anti-entropy pull fetches
+   just the operations written since the vacuum. Uploaded files are
+   backfilled in the background (`blob backfill`), and a
+   relation-integrity check runs once everything settles.
+
+If the seed runs an older pbreplication without snapshot support (404),
+or the copy keeps failing for `FullCopyFallbackAfter`, the node falls
+back to the classic logical row-by-row bootstrap automatically.
+
+### Long-offline nodes (`ResyncStrategy`)
+
+A node offline longer than `TombstoneRetention` can't replay the oplog
+(deletes were compacted away) and must resync:
+
+- `"logical"` (default): an in-process row-by-row snapshot sync with
+  reconcile — no restart needed. Progress is resumable across restarts
+  and applies in batched transactions.
+- `"restart-copy"`: the node flags itself (`resync_pending`), logs and
+  emits a `RESTART THIS NODE` event, and on the next start replaces its
+  database with a full copy. **Local writes the cluster never received
+  are rescued first** (to `.pbreplication/rescue.json`) and re-applied
+  after startup through the normal conflict resolution with their
+  original timestamps — a newer cluster write still wins, everything
+  else replicates out. Best for very large databases where a row-by-row
+  resync would take hours.
+
+The auxiliary database (`auxiliary.db`, PocketBase's `_logs`) is
+node-local and never copied.
+
+## Go API
+
+Beyond the HTTP endpoints, the `*Replicator` handle returned by
+`Register`/`MustRegister` exposes the cluster to your Go code:
+
+```go
+r := pbreplication.MustRegister(app, cfg)
+
+r.NodeID()      // this node's persistent id
+r.Ready()       // finished bootstrapping?
+r.Members()     // []MemberInfo: every member incl. health
+r.PeerURLs()    // healthy peer id -> URL
+r.LeaderID()    // deterministic leader (lowest healthy id)
+r.IsLeader()    // gate singleton work (cron jobs, ...)
+
+r.Status()      // ClusterStatus: everything /status returns, typed
+r.SyncStatus()  // live bulk-sync phase/progress/ETA
+r.Counters()    // applied/failed/blocked, oplog size, backlogs
+r.PeerLags()    // per-peer: how many of our ops they haven't acked
+r.LastError()   // most recent replication error
+
+r.Events(100)                  // newest events from the ring buffer
+unsub := r.OnEvent(func(ev pbreplication.Event) { ... }) // subscribe
+r.RunIntegrityCheck(ctx)       // on-demand dangling-relation scan
+r.LastIntegrityReport()        // result of the last scan
+```
+
 ## Limitations & operational notes
 
 - **Eventual consistency.** Replication is asynchronous; a read on
@@ -248,25 +367,43 @@ compaction horizon are automatically resynced from a full snapshot.
   database. Use long random secrets, HTTPS or a private network between
   nodes, and consider a `replication`-scope firewall whitelist.
 
-## Migrations & seeding on joining nodes
+## Migrations & seeding on clustered nodes
 
-A node that starts for the first time with a `SeedURL` does **not** run
-the app's migrations before serving. Instead it:
+App migrations on a clustered node (a `SeedURL` is configured, or peers
+are already known) are **coordinated with the cluster on every start**,
+not just the first one:
 
-1. pulls the full snapshot (schema + records + files) from the seed —
-   the effects of every migration and seed script the cluster already
-   ran arrive with it;
-2. marks the migrations the seed reports as applied in the local
-   `_migrations` table **without executing them**;
-3. runs only the remaining migrations (e.g. when the joining binary is
-   newer and ships migrations the cluster hasn't seen) — their writes
+1. At startup the app's migrations are held back, so PocketBase's
+   serve-time runner applies only its own system migrations.
+2. A brand-new node gets the effects of every past migration with the
+   bootstrap (full database copy or snapshot sync) and imports the
+   cluster's `_migrations` history without executing anything.
+3. The node then asks **every reachable peer** which migration files it
+   executed (`GET /api/replication/migrations`) and marks the union as
+   applied — covering migrations some other node ran while this one was
+   offline.
+4. Only migrations **no member has run** execute locally; their writes
    replicate out normally.
 
-This prevents re-running migrations and seed scripts whose results
-already exist in the cluster. On every later start (and on the first
-node of a new cluster) migrations run normally at startup. Set
-`DeferMigrationsUntilSynced: false` to restore the old
-migrate-then-sync behavior.
+This closes the classic duplicate-seed hazard: a migration that inserts
+records with generated ids can no longer run on two nodes and produce
+duplicated rows — whichever node runs it first wins, everyone else
+imports it as done.
+
+Fallbacks and edge cases:
+
+- If **no peer answers** within `MigrationCoordinationTimeout`, the
+  node runs its deferred migrations locally — it never stays
+  schema-less waiting for an unreachable cluster.
+- A standalone node (no seed, no known peers) never defers — plain
+  PocketBase behavior.
+- Two nodes restarted **simultaneously** with the same brand-new
+  migration: non-leader nodes wait one `SyncInterval` and re-check
+  before running, which narrows but cannot fully eliminate the race
+  (there is no distributed lock). Write seeding migrations
+  idempotently (fixed ids, or guard with an existence check).
+- Set `DeferMigrationsUntilSynced: false` to restore plain
+  migrate-at-startup behavior everywhere.
 
 ### Startup & migration logs
 
@@ -392,8 +529,14 @@ go test ./...
 
 The suite covers the HLC, LWW gating, capture→apply round-trips
 (including autodate preservation and hook firing), schema-op
-idempotence, HMAC auth, compaction/garbage collection and the firewall
-matcher. The `example/` compose file doubles as an end-to-end test bed.
+idempotence, HMAC auth (incl. body-size caps), transport retries and
+resumable streams, the event ring buffer and health transitions, peer
+lag, batched snapshot applies with persisted resume cursors, the paged
+reconcile, the full database copy end-to-end (vacuum, chunked resume,
+sanitize, offline-write rescue/replay, old-peer fallback), migration
+coordination, relation-integrity scans, compaction/garbage collection
+and the firewall matcher. The `example/` compose file doubles as an
+end-to-end test bed.
 
 ## Releases & versioning
 

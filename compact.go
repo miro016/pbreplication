@@ -25,6 +25,7 @@ func (r *Replicator) compactLoop() {
 			if err := r.compact(); err != nil {
 				r.logError("compaction failed", err)
 			}
+			r.cleanupDBSnapshots()
 		}
 	}
 }
@@ -116,11 +117,22 @@ func (r *Replicator) compact() error {
 		}
 
 		// 4. flag long-gone members as removed...
+		var flagged []string
+		err = db.NewQuery(`SELECT node_id FROM _repl_members
+			WHERE node_id != {:self} AND removed = 0 AND last_seen < {:cut}`).
+			Bind(dbx.Params{"self": r.nodeID, "cut": tombstoneCutoff}).Column(&flagged)
+		if err != nil {
+			return err
+		}
 		_, err = db.NewQuery(`UPDATE _repl_members SET removed = 1
 			WHERE node_id != {:self} AND removed = 0 AND last_seen < {:cut}`).
 			Bind(dbx.Params{"self": r.nodeID, "cut": tombstoneCutoff}).Execute()
 		if err != nil {
 			return err
+		}
+		for _, nodeID := range flagged {
+			r.logMilestone("member removed from cluster (not seen within tombstone retention)", "peer", nodeID)
+			r.emitEvent(EventNodeRemoved, "member removed from cluster", "peer", nodeID)
 		}
 
 		// ...and purge them (plus their bookkeeping) after 2x retention
