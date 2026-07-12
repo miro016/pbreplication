@@ -25,6 +25,7 @@ func (r *Replicator) registerRoutes(se *core.ServeEvent) {
 	n.GET("/snapshot/records", r.serveSnapshotRecords)
 	n.POST("/snapshot/db", r.handleDBSnapshotPrepare)
 	n.GET("/snapshot/db/chunk", r.handleDBSnapshotChunk)
+	n.GET("/migrations", r.handleMigrations)
 
 	// --- admin endpoints ---
 	g.GET("/status", r.handleStatus).Bind(apis.RequireSuperuserAuth())
@@ -183,6 +184,17 @@ func (r *Replicator) noteSender(s senderInfo) {
 		cur.Reachable = true
 	}
 	_ = upsertMember(db, cur)
+}
+
+// handleMigrations reports which migration files this node has
+// executed, so starting peers can coordinate instead of re-running
+// migrations whose effects already replicated.
+func (r *Replicator) handleMigrations(e *core.RequestEvent) error {
+	applied, err := listAppliedMigrations(r.app.DB())
+	if err != nil {
+		return e.InternalServerError("failed to list migrations", nil)
+	}
+	return e.JSON(http.StatusOK, &migrationsResponse{NodeID: r.nodeID, Applied: applied})
 }
 
 // handleEvents serves the replication event timeline, newest first.

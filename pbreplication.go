@@ -173,6 +173,11 @@ type Config struct {
 	// Default: 10m.
 	SnapshotCacheTTL time.Duration
 
+	// MigrationCoordinationTimeout bounds how long a starting node waits
+	// for peers to report their executed migrations before falling back
+	// to running the deferred migrations locally. Default: 30s.
+	MigrationCoordinationTimeout time.Duration
+
 	// ResyncStrategy selects how a node that fell behind compaction
 	// (snapshot_required) catches up:
 	//   "logical"      - row-by-row snapshot sync in-process (default)
@@ -235,6 +240,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.SnapshotCacheTTL <= 0 {
 		c.SnapshotCacheTTL = 10 * time.Minute
+	}
+	if c.MigrationCoordinationTimeout <= 0 {
+		c.MigrationCoordinationTimeout = 30 * time.Second
 	}
 	if c.ResyncStrategy == "" {
 		c.ResyncStrategy = "logical"

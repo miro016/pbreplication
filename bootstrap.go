@@ -84,6 +84,9 @@ func (r *Replicator) bootstrapOrRejoin() error {
 			}
 			r.logMilestone("cluster initialized (this is the first/seed node)", "node", r.nodeID)
 		}
+		// a seed node restarting with peers still coordinates its own
+		// new migrations against them
+		r.coordinateMigrations()
 		return nil
 	}
 
@@ -95,6 +98,9 @@ func (r *Replicator) bootstrapOrRejoin() error {
 			return fmt.Errorf("initial join via seed %s failed: %w", r.cfg.SeedURL, err)
 		}
 		r.logError("re-join announce failed (anti-entropy continues)", err)
+		// deferred migrations must still run - coordinateMigrations has
+		// its own peer-unreachable fallback
+		r.coordinateMigrations()
 		return nil
 	}
 
@@ -123,15 +129,17 @@ func (r *Replicator) bootstrapOrRejoin() error {
 			return err
 		}
 		r.logMilestone("initial bootstrap complete", "node", r.nodeID, "seed", r.cfg.SeedURL)
-		// Now run only the migrations the cluster has NOT applied. A
-		// failure here doesn't fail the bootstrap: on restart the defer
-		// branch is skipped and PocketBase's serve-time migration run
-		// retries exactly the unapplied ones.
-		if err := r.runDeferredMigrations(); err != nil {
-			r.logError("post-sync app migrations failed", err)
-		}
+		// Now run only the migrations NO cluster member has applied
+		// (the seed's own history was already imported above; the
+		// coordination union covers migrations other peers ran that the
+		// seed didn't). A failure here doesn't fail the bootstrap: the
+		// migration runner retries unapplied files on the next start.
+		r.coordinateMigrations()
 	} else {
 		r.logMilestone("rejoined cluster", "node", r.nodeID, "members", len(join.Members))
+		// an already-bootstrapped node may carry NEW migrations after an
+		// upgrade - never run one a peer already ran (duplicate seeds)
+		r.coordinateMigrations()
 	}
 
 	wake(r.pullWake)
