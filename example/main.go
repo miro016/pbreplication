@@ -2,11 +2,14 @@
 //
 // Configuration via environment variables:
 //
-//	PBR_NODE_URL       - this node's URL as reachable by OTHER nodes
-//	PBR_SEED_URL       - URL of any existing cluster member (empty on the first node)
-//	PBR_CLUSTER_SECRET - shared cluster password (min 16 chars)
-//	PBR_GEOIP_DB       - optional path to a MaxMind .mmdb for country firewall rules
-//	PBR_IPAPI_KEY      - optional ip-api.com paid API key (dashboard map geolocation)
+//	PBR_NODE_URL        - this node's URL as reachable by OTHER nodes
+//	PBR_SEED_URL        - URL of any existing cluster member (empty on the first node)
+//	PBR_CLUSTER_SECRET  - shared cluster password (min 16 chars)
+//	PBR_GEOIP_DB        - optional path to a MaxMind .mmdb for country firewall rules
+//	PBR_IPAPI_KEY       - optional ip-api.com paid API key (dashboard map geolocation)
+//	PBR_RESYNC_STRATEGY - optional: "logical" (default) or "restart-copy"
+//	                      (full DB copy on restart for nodes that fell
+//	                      behind compaction; local writes are rescued)
 package main
 
 import (
@@ -21,11 +24,12 @@ func main() {
 	app := pocketbase.New()
 
 	pbreplication.MustRegister(app, pbreplication.Config{
-		NodeURL:       os.Getenv("PBR_NODE_URL"),
-		SeedURL:       os.Getenv("PBR_SEED_URL"),
-		ClusterSecret: os.Getenv("PBR_CLUSTER_SECRET"),
-		GeoIPDBPath:   os.Getenv("PBR_GEOIP_DB"),
-		IPAPIKey:      os.Getenv("PBR_IPAPI_KEY"),
+		NodeURL:        os.Getenv("PBR_NODE_URL"),
+		SeedURL:        os.Getenv("PBR_SEED_URL"),
+		ClusterSecret:  os.Getenv("PBR_CLUSTER_SECRET"),
+		GeoIPDBPath:    os.Getenv("PBR_GEOIP_DB"),
+		IPAPIKey:       os.Getenv("PBR_IPAPI_KEY"),
+		ResyncStrategy: os.Getenv("PBR_RESYNC_STRATEGY"),
 	})
 
 	if err := app.Start(); err != nil {

@@ -42,18 +42,46 @@
   <span class="id" id="selfId"></span>
   <nav>
     <button id="tabNodes" class="active" onclick="showTab('nodes')">Nodes</button>
+    <button id="tabEvents" onclick="showTab('events')">Events</button>
     <button id="tabFirewall" onclick="showTab('firewall')">Firewall</button>
     <button id="tabMap" onclick="showTab('map')">Map</button>
   </nav>
 </header>
 <main>
   <section id="nodes">
+    <div id="syncBanner" style="display:none"></div>
     <div class="cards" id="statCards"></div>
     <table>
-      <thead><tr><th>Node</th><th>URL</th><th>Health</th><th>Mode</th><th>Applied seq</th><th>Last seen</th></tr></thead>
-      <tbody id="memberRows"><tr><td colspan="6">Loading…</td></tr></tbody>
+      <thead><tr><th>Node</th><th>URL</th><th>Health</th><th>Mode</th><th>Applied seq</th><th>Lag</th><th>Last seen</th></tr></thead>
+      <tbody id="memberRows"><tr><td colspan="7">Loading…</td></tr></tbody>
     </table>
+    <div id="integrityLine" style="margin-top:8px"></div>
     <div class="err" id="statusErr"></div>
+  </section>
+
+  <section id="events" style="display:none">
+    <div style="margin-bottom:10px">
+      <select id="evFilter" onchange="refreshEvents()">
+        <option value="">all event types</option>
+        <option value="node_joined">node joined</option>
+        <option value="node_removed">node removed</option>
+        <option value="peer_healthy">peer healthy</option>
+        <option value="peer_unhealthy">peer unhealthy</option>
+        <option value="snapshot_started">snapshot started</option>
+        <option value="snapshot_finished">snapshot finished</option>
+        <option value="copy_started">copy started</option>
+        <option value="copy_finished">copy finished</option>
+        <option value="op_failed">op failed</option>
+        <option value="migration_run">migration run</option>
+        <option value="firewall_block">firewall block</option>
+        <option value="integrity_report">integrity report</option>
+      </select>
+    </div>
+    <table>
+      <thead><tr><th>When</th><th>Type</th><th>Peer</th><th>Collection</th><th>Message</th><th>Details</th></tr></thead>
+      <tbody id="eventRows"><tr><td colspan="6">Loading…</td></tr></tbody>
+    </table>
+    <div class="err" id="eventsErr"></div>
   </section>
 
   <section id="firewall" style="display:none">
@@ -205,10 +233,78 @@ async function refreshStatus() {
       '<td><span class="pill ' + (m.healthy ? 'ok">healthy' : 'bad">offline') + '</span></td>' +
       '<td>' + (m.reachable ? 'push+pull' : 'pull-only') + '</td>' +
       '<td class="mono">' + esc(m.applied_seq) + '</td>' +
-      '<td>' + (m.self ? 'now' : esc(ago(m.last_seen))) + '</td></tr>').join('') || '<tr><td colspan="6">No members</td></tr>';
+      '<td class="mono">' + lagText(m) + '</td>' +
+      '<td>' + (m.self ? 'now' : esc(ago(m.last_seen))) + '</td></tr>').join('') || '<tr><td colspan="7">No members</td></tr>';
+    renderSyncBanner(st.sync);
+    renderIntegrity(st.integrity);
     document.getElementById('statusErr').textContent = st.last_error || '';
   } catch (err) {
     document.getElementById('statusErr').textContent = 'Status request failed: ' + err.message;
+  }
+}
+
+function lagText(m) {
+  if (m.self) return '—';
+  if (m.lag_ops == null || m.lag_ops < 0) return '?';
+  return m.lag_ops === 0 ? '<span class="pill ok">0</span>' : esc(m.lag_ops) + ' ops';
+}
+
+// live banner for bulk syncs (initial sync, resync, full DB copy, ...)
+function renderSyncBanner(sync) {
+  const el = document.getElementById('syncBanner');
+  if (!sync || !sync.phase || sync.phase === 'idle') { el.style.display = 'none'; return; }
+  const label = {
+    copying: 'Copying database',
+    snapshotting: 'Initial sync',
+    resyncing: 'Resync',
+    blob_backfill: 'Fetching files',
+    integrity_check: 'Integrity check',
+  }[sync.phase] || sync.phase;
+  let detail = '';
+  if (sync.bytes_total > 0) {
+    detail = Math.round(sync.bytes_done / 1048576) + ' / ' + Math.round(sync.bytes_total / 1048576) + ' MB';
+  } else if (sync.total_rows > 0) {
+    detail = sync.done_rows + ' / ' + sync.total_rows + ' rows';
+    if (sync.collection) detail += ' · ' + esc(sync.collection);
+  }
+  const pct = Math.max(0, Math.min(100, sync.percent || 0));
+  el.style.display = '';
+  el.innerHTML =
+    '<div class="card" style="width:100%;box-sizing:border-box;margin-bottom:14px">' +
+    '<b>' + esc(label) + (sync.peer ? ' <span class="id">from ' + esc(sync.peer) + '</span>' : '') + '</b>' +
+    '<div style="background:var(--line);border-radius:6px;height:10px;margin:8px 0;overflow:hidden">' +
+    '<div style="background:#3b82f6;height:100%;width:' + pct + '%;transition:width .5s"></div></div>' +
+    '<span>' + pct + '%' + (detail ? ' · ' + detail : '') +
+    (sync.eta ? ' · ETA ' + esc(sync.eta) : '') + '</span></div>';
+}
+
+function renderIntegrity(rep) {
+  const el = document.getElementById('integrityLine');
+  if (!rep) { el.innerHTML = ''; return; }
+  const total = rep.truncated_at || (rep.dangling || []).length;
+  el.innerHTML = rep.converged
+    ? '<span class="pill ok">integrity ✓</span> <span class="id">' + esc(rep.scanned_records) + ' records, ' + esc(rep.checked_refs) + ' relations checked</span>'
+    : '<span class="pill bad">integrity: ' + esc(total) + ' dangling relation(s)</span> <span class="id">see /api/replication/integrity</span>';
+}
+
+async function refreshEvents() {
+  try {
+    const data = await api('/api/replication/events?limit=200');
+    const filter = document.getElementById('evFilter').value;
+    const evs = (data.events || []).filter(e => !filter || e.type === filter);
+    document.getElementById('eventRows').innerHTML = evs.map(e => {
+      const fields = e.fields ? Object.entries(e.fields).map(([k, v]) => esc(k) + '=' + esc(v)).join(' ') : '';
+      const bad = e.type === 'op_failed' || e.type === 'peer_unhealthy' || e.type === 'firewall_block';
+      return '<tr><td title="' + esc(e.time) + '">' + esc(ago(e.time)) + '</td>' +
+        '<td><span class="pill ' + (bad ? 'bad' : 'gray') + '">' + esc(e.type) + '</span></td>' +
+        '<td class="mono">' + esc(e.peer || '') + '</td>' +
+        '<td class="mono">' + esc(e.collection || '') + '</td>' +
+        '<td>' + esc(e.message) + '</td>' +
+        '<td class="id">' + fields + '</td></tr>';
+    }).join('') || '<tr><td colspan="6">No events yet</td></tr>';
+    document.getElementById('eventsErr').textContent = '';
+  } catch (err) {
+    document.getElementById('eventsErr').textContent = 'Events request failed: ' + err.message;
   }
 }
 
@@ -490,10 +586,11 @@ document.getElementById('worldCanvas').addEventListener('mouseleave', () => {
 });
 
 function showTab(name) {
-  for (const t of ['nodes', 'firewall', 'map']) {
+  for (const t of ['nodes', 'events', 'firewall', 'map']) {
     document.getElementById(t).style.display = name === t ? '' : 'none';
     document.getElementById('tab' + t[0].toUpperCase() + t.slice(1)).classList.toggle('active', name === t);
   }
+  if (name === 'events') refreshEvents();
   if (name === 'firewall') refreshFirewall();
   if (name === 'map') refreshMap();
 }
@@ -501,6 +598,7 @@ function showTab(name) {
 refreshStatus();
 setInterval(refreshStatus, 5000);
 setInterval(() => {
+  if (document.getElementById('events').style.display !== 'none') refreshEvents();
   if (document.getElementById('firewall').style.display !== 'none') refreshFirewall();
   if (document.getElementById('map').style.display !== 'none') refreshMap();
 }, 10000);
