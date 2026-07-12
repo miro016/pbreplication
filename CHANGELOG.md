@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/miro016/pbreplication/compare/v0.3.0...v0.4.0) (2026-07-12)
+
+
+### Features
+
+* cluster-coordinated migrations on every startup ([f591967](https://github.com/miro016/pbreplication/commit/f591967a36c757747aaa87c3ebddae2eb431f0b8))
+* dashboard sync progress, lag column, events tab; docs for the new stack ([b2eb7f3](https://github.com/miro016/pbreplication/commit/b2eb7f35d97f4493a43a81c29ba079bb2a6a602c))
+* exported Go status API (Status, SyncStatus, Counters, PeerLags) ([ec9c2d7](https://github.com/miro016/pbreplication/commit/ec9c2d7e135c85a69ffe019a8e5df70fca8a7b2d))
+* full database copy bootstrap with offline-write rescue ([504d13e](https://github.com/miro016/pbreplication/commit/504d13ea753a52599bca96122e5abff2dfa2b74f))
+* harden node-to-node transport (per-request timeouts, retries, resumable streams) ([a664d65](https://github.com/miro016/pbreplication/commit/a664d658d6f3e142379693c2e262e7649debaae4))
+* harden node-to-node transport (per-request timeouts, retries, resumable streams) ([c197d6f](https://github.com/miro016/pbreplication/commit/c197d6f073e4f993aca79cc5883d630e2498a826))
+* relation-integrity validation after bulk syncs ([23c9811](https://github.com/miro016/pbreplication/commit/23c9811fd2481103cdb9f51d707a9001ae729269))
+* replication event timeline, health-transition logs and per-peer lag ([64e7002](https://github.com/miro016/pbreplication/commit/64e70025b372ecb6d7b25c8366c57a0fe9f25699))
+
+
+### Performance
+
+* batched snapshot applies, persisted resume cursor, memory-safe reconcile ([7bf2460](https://github.com/miro016/pbreplication/commit/7bf246063b68a5c62596c8fd2fb52eb24b710bc9))
+
 ## [0.3.0](https://github.com/miro016/pbreplication/compare/v0.2.0...v0.3.0) (2026-07-09)
 
 
