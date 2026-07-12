@@ -237,6 +237,30 @@ type syncProgress struct {
 	start    time.Time     // sync start
 	lastLog  time.Time     // last time an ETA line was persisted
 	logEvery time.Duration // min interval between persisted ETA lines
+	phase    SyncPhase     // published to the live SyncStatus
+	peer     string        // node the data comes from
+}
+
+// publishSnapshotProgress mirrors the snapshot loop's progress into the
+// live SyncStatus consumed by the dashboard and the exported API.
+func (r *Replicator) publishSnapshotProgress(p *syncProgress, collection string) {
+	if p == nil {
+		return
+	}
+	phase := p.phase
+	if phase == "" {
+		phase = SyncSnapshotting
+	}
+	r.publishProgress(SyncStatus{
+		Phase:      phase,
+		Peer:       p.peer,
+		Collection: collection,
+		DoneRows:   p.done,
+		TotalRows:  p.total,
+		Percent:    p.percent(),
+		ETA:        p.etaRemaining(),
+		StartedAt:  p.start,
+	})
 }
 
 // etaRemaining estimates the time left based on the average row rate so
@@ -359,12 +383,22 @@ func (r *Replicator) snapshotFrom(baseURL string, reconcile bool) (*snapshotMeta
 	// total expected rows across replicated collections, for ETA. When
 	// the peer is too old to report counts (meta.Counts == nil) this
 	// stays 0 and no ETA is shown.
-	prog := &syncProgress{start: time.Now(), logEvery: 15 * time.Second}
+	prog := &syncProgress{
+		start:    time.Now(),
+		logEvery: 15 * time.Second,
+		phase:    SyncSnapshotting,
+		peer:     meta.NodeID,
+	}
+	if reconcile {
+		prog.phase = SyncResyncing
+	}
 	for _, col := range cols {
 		if r.isReplicated(col) {
 			prog.total += meta.Counts[col.Name]
 		}
 	}
+	r.publishSnapshotProgress(prog, "")
+	defer r.clearProgress()
 	if prog.total > 0 {
 		r.logMilestone("estimating full sync duration", "rows_to_sync", prog.total)
 	}
@@ -468,6 +502,7 @@ func (r *Replicator) snapshotCollection(baseURL, peerNode string, col *core.Coll
 		// advance the overall counter and refresh the ETA
 		if prog != nil {
 			prog.done += int64(len(page.Items))
+			r.publishSnapshotProgress(prog, col.Name)
 		}
 
 		// live progress line, updated in place per page. Include the

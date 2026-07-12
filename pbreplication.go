@@ -250,6 +250,9 @@ type Replicator struct {
 	// replication event timeline (ring buffer + subscribers)
 	events *eventLog
 
+	// live bulk-sync progress (snapshot / full copy / integrity check)
+	progressState atomic.Pointer[SyncStatus]
+
 	// last observed health per peer, for transition detection
 	healthMu   sync.Mutex
 	prevHealth map[string]bool
