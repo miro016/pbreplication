@@ -42,6 +42,12 @@ const (
 	// fields for blobs missing from local storage (a full DB copy
 	// transfers no files) until a pass completes cleanly.
 	stateBlobBackfillPending = "blob_backfill_pending"
+
+	// stateDupNodePending, when set, records that another running node
+	// uses this node's id (a cloned data directory). The value is the
+	// seed's acknowledged sequence for the shared id (-1 when unknown);
+	// the next process start regenerates the identity before serving.
+	stateDupNodePending = "dup_node_pending"
 )
 
 // collectionsColID is the pseudo collection id used in _repl_versions

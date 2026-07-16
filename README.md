@@ -510,6 +510,22 @@ URLs from the member list and starts failing. Fixes:
   advertised URL automatically keeps using the configured seed URL for
   that peer (shown as "override" in the dashboard).
 
+**Both nodes show the same node id, and the cluster table only lists one
+node ("this node") on each instance** — the second node was started on a
+*copy* of the first node's `pb_data` directory (or `data.db`), so it
+inherited the first node's persisted identity. Two nodes then run under
+one id, every join looks like a self-announcement, and nothing
+replicates. Current versions detect this automatically: on startup the
+node probes its seed and, when the seed answers with the node's own id,
+regenerates a fresh identity in place (local data is kept; writes the
+original doesn't know about are re-emitted under the new id). If the
+duplicate is only discovered later (e.g. both twins started at the same
+time), the node logs `ANOTHER CLUSTER NODE ALREADY USES THIS NODE'S ID`
+and heals itself on its next restart. To avoid the situation entirely:
+never clone `pb_data` to provision a node — start the new node with an
+**empty** data directory and let the full-copy bootstrap transfer the
+data (it assigns a fresh identity as part of the copy).
+
 **Nodes don't see each other** — check that all nodes share the exact
 same `PBR_CLUSTER_SECRET`, that the seed URL is reachable *from inside*
 the node's network namespace (in compose, use service names like
