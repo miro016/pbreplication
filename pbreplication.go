@@ -280,6 +280,11 @@ type Replicator struct {
 	nodeID string
 	ready  atomic.Bool
 
+	// instanceID identifies this PROCESS and is never persisted. Two
+	// processes sharing a nodeID but differing here are the signature of
+	// a cloned data directory (see identity.go).
+	instanceID string
+
 	// jsonClient serves bounded request/response exchanges; each call
 	// carries its own context deadline (cfg.RequestTimeout). streamClient
 	// has no overall timeout so long-running streams (blobs, database
@@ -397,9 +402,10 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 
 	runCtx, runCancel := context.WithCancel(context.Background())
 	r := &Replicator{
-		app:   app,
-		cfg:   cfg,
-		clock: newHLC(),
+		app:        app,
+		cfg:        cfg,
+		clock:      newHLC(),
+		instanceID: security.RandomString(15),
 		jsonClient: &http.Client{
 			// no flat Timeout: every call sets a context deadline
 			Transport: newPeerTransport(),
@@ -539,6 +545,14 @@ func (r *Replicator) initStorage(app core.App) error {
 }
 
 func (r *Replicator) startBackground() {
+	// The initial push cursor must predate any op re-emitted by the
+	// duplicate-id resolution below, so those ops still reach the peers.
+	head, headErr := maxRowID(r.app.DB())
+
+	// Still pre-serve: nothing reads r.nodeID concurrently yet, so a
+	// duplicated identity (cloned data directory) can be swapped safely.
+	r.resolveDuplicateNodeID()
+
 	// Now that we are actually serving as a node, set our advertised
 	// URL authoritatively (a restart may use a new NodeURL).
 	_ = upsertMember(r.app.NonconcurrentDB(), &member{
@@ -548,7 +562,7 @@ func (r *Replicator) startBackground() {
 		LastSeen:  nowStr(),
 	})
 
-	if head, err := maxRowID(r.app.DB()); err == nil {
+	if headErr == nil {
 		r.cursorMu.Lock()
 		r.startRowID = head
 		r.cursorMu.Unlock()

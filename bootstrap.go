@@ -3,6 +3,7 @@ package pbreplication
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -18,6 +19,11 @@ import (
 type joinRequest struct {
 	NodeID string `json:"node_id"`
 	URL    string `json:"url,omitempty"`
+	// InstanceID identifies the joining PROCESS (random per start, never
+	// persisted). It lets the receiver tell a request that looped back to
+	// itself apart from a different process claiming the same node id -
+	// i.e. a cloned data directory. Empty on old-version joiners.
+	InstanceID string `json:"instance_id,omitempty"`
 }
 
 type joinResponse struct {
@@ -27,6 +33,8 @@ type joinResponse struct {
 	// URLVerified reports whether the seed could reach the URL the
 	// joiner advertised (callback ping succeeded).
 	URLVerified bool `json:"url_verified"`
+	// InstanceID is the answering PROCESS's random id (see joinRequest).
+	InstanceID string `json:"instance_id,omitempty"`
 }
 
 type snapshotMeta struct {
@@ -100,6 +108,13 @@ func (r *Replicator) bootstrapOrRejoin() error {
 	// restart with a changed address)
 	join, err := r.joinCluster()
 	if err != nil {
+		if errors.Is(err, errDuplicateNodeID) {
+			// Persistently flagged by joinCluster: the next start
+			// regenerates this node's identity BEFORE serving. Swapping
+			// the id while handlers and capture hooks are live isn't
+			// safe, so run standalone instead of hammering the seed.
+			return nil
+		}
 		if done == "" {
 			return fmt.Errorf("initial join via seed %s failed: %w", r.cfg.SeedURL, err)
 		}
@@ -155,10 +170,28 @@ func (r *Replicator) bootstrapOrRejoin() error {
 // joinCluster registers this node with the seed and merges the member
 // list it returns.
 func (r *Replicator) joinCluster() (*joinResponse, error) {
-	req := &joinRequest{NodeID: r.nodeID, URL: r.cfg.NodeURL}
+	req := &joinRequest{NodeID: r.nodeID, URL: r.cfg.NodeURL, InstanceID: r.instanceID}
 	var resp joinResponse
 	if err := r.callPeer(r.cfg.SeedURL, http.MethodPost, "/api/replication/join", req, &resp); err != nil {
+		if httpStatus(err) == http.StatusConflict {
+			// a duplicate-aware seed refused the join because it runs
+			// under our id itself - this database is a clone of its
+			r.flagDuplicateNodeID(-1)
+			return nil, fmt.Errorf("%w: %v", errDuplicateNodeID, err)
+		}
 		return nil, err
+	}
+	if resp.NodeID == r.nodeID && resp.InstanceID != r.instanceID {
+		// The answer claims our id but came from a different process (an
+		// old-version seed without the 409 check, or one without instance
+		// ids at all - a request looping back to THIS process would have
+		// echoed our own instance id).
+		ack := int64(-1)
+		if resp.Vector != nil {
+			ack = resp.Vector[r.nodeID]
+		}
+		r.flagDuplicateNodeID(ack)
+		return nil, errDuplicateNodeID
 	}
 	r.mergeMembers(resp.Members)
 

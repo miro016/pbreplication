@@ -54,6 +54,21 @@ func (r *Replicator) handleJoin(e *core.RequestEvent) error {
 		return e.BadRequestError("invalid join request", nil)
 	}
 
+	// A DIFFERENT process presenting OUR id runs on a clone of this
+	// node's data directory. Refuse the join so the joiner flags itself
+	// and regenerates its identity on its next start. (A request that
+	// looped back to this process carries our own instance id and passes;
+	// old-version joiners without an instance id pass too - their clones
+	// are caught by their own pre-serve probe instead.)
+	if req.NodeID == r.nodeID && req.InstanceID != "" && req.InstanceID != r.instanceID {
+		r.logWarn("join rejected: another node presented this node's id - "+
+			"its data directory is probably a clone of this node's",
+			"node", r.nodeID, "url", req.URL)
+		r.emitEvent(EventDuplicateNode, "join rejected: another node uses this node's id (cloned data directory?)",
+			"peer", req.NodeID, "url", req.URL)
+		return e.Error(http.StatusConflict, "duplicate node id: this id belongs to the receiving node", nil)
+	}
+
 	reachable := false
 	if req.URL != "" {
 		reachable = r.verifyPeerURL(req.URL, req.NodeID)
@@ -90,6 +105,7 @@ func (r *Replicator) handleJoin(e *core.RequestEvent) error {
 		Members:     members,
 		Vector:      vector,
 		URLVerified: reachable,
+		InstanceID:  r.instanceID,
 	})
 }
 

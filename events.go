@@ -9,20 +9,21 @@ import (
 type EventType string
 
 const (
-	EventNodeJoined      EventType = "node_joined"
-	EventNodeRemoved     EventType = "node_removed"
-	EventPeerHealthy     EventType = "peer_healthy"
-	EventPeerUnhealthy   EventType = "peer_unhealthy"
-	EventSyncStarted     EventType = "sync_started"
-	EventSyncFinished    EventType = "sync_finished"
+	EventNodeJoined       EventType = "node_joined"
+	EventNodeRemoved      EventType = "node_removed"
+	EventDuplicateNode    EventType = "duplicate_node_id"
+	EventPeerHealthy      EventType = "peer_healthy"
+	EventPeerUnhealthy    EventType = "peer_unhealthy"
+	EventSyncStarted      EventType = "sync_started"
+	EventSyncFinished     EventType = "sync_finished"
 	EventSnapshotStarted  EventType = "snapshot_started"
 	EventSnapshotFinished EventType = "snapshot_finished"
-	EventCopyStarted     EventType = "copy_started"
-	EventCopyFinished    EventType = "copy_finished"
-	EventOpFailed        EventType = "op_failed"
-	EventMigrationRun    EventType = "migration_run"
-	EventFirewallBlock   EventType = "firewall_block"
-	EventIntegrityReport EventType = "integrity_report"
+	EventCopyStarted      EventType = "copy_started"
+	EventCopyFinished     EventType = "copy_finished"
+	EventOpFailed         EventType = "op_failed"
+	EventMigrationRun     EventType = "migration_run"
+	EventFirewallBlock    EventType = "firewall_block"
+	EventIntegrityReport  EventType = "integrity_report"
 )
 
 // Event is one entry of the replication event timeline. Events are held
