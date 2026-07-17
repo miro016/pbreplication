@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/miro016/pbreplication/compare/v0.4.0...v0.4.1) (2026-07-17)
+
+
+### Bug Fixes
+
+* detect and heal duplicate node ids from cloned data directories ([3a017b8](https://github.com/miro016/pbreplication/commit/3a017b83d7e9677832b9bcc9b019e41382702793))
+* detect and heal duplicate node ids from cloned data directories ([4d94566](https://github.com/miro016/pbreplication/commit/4d9456685645fddb1aea17ce109d6ec644b63214))
+
 ## [0.4.0](https://github.com/miro016/pbreplication/compare/v0.3.0...v0.4.0) (2026-07-12)
 
 
