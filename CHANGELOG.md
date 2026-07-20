@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/miro016/pbreplication/compare/v0.4.1...v0.4.2) (2026-07-20)
+
+
+### Bug Fixes
+
+* clear stale peer sync error from dashboard after successful rejoin ([25719eb](https://github.com/miro016/pbreplication/commit/25719eb632dc89bbb200ad2cc48f78333424c7d0))
+
 ## [0.4.1](https://github.com/miro016/pbreplication/compare/v0.4.0...v0.4.1) (2026-07-17)
 
 
