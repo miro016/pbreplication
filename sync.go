@@ -3,6 +3,7 @@ package pbreplication
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -526,18 +527,33 @@ func (r *Replicator) peerURL(m *member) string {
 	return m.URL
 }
 
+// peerErrPrefix is the message prefix used for peer sync failures, so
+// clearPeerErr can recognize (and retract) them in the global last-error
+// slot once the peer recovers.
+func peerErrPrefix(nodeID string) string {
+	return "sync with peer " + nodeID + " failing"
+}
+
 // notePeerErr records (and logs, on first occurrence) a failed exchange
 // with a peer, so connectivity problems are visible on the dashboard
 // instead of silently stalling replication.
 func (r *Replicator) notePeerErr(nodeID string, err error) {
 	if prev, _ := r.memberErrs.Load(nodeID); prev == nil || prev.(string) == "" {
-		r.logError("sync with peer "+nodeID+" failing", err)
+		r.logError(peerErrPrefix(nodeID), err)
 	}
 	r.memberErrs.Store(nodeID, err.Error())
 }
 
 func (r *Replicator) clearPeerErr(nodeID string) {
 	r.memberErrs.Store(nodeID, "")
+	// If the global last-error still shows this peer's sync failure,
+	// retract it: the condition healed, and keeping it around makes the
+	// dashboard report a problem that no longer exists.
+	if v := r.stats.lastError.Load(); v != nil {
+		if s, _ := v.(string); strings.HasPrefix(s, peerErrPrefix(nodeID)) {
+			r.stats.lastError.CompareAndSwap(v, "")
+		}
+	}
 }
 
 // isHealthy reports whether a member was seen recently enough.
