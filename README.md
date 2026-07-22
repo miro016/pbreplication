@@ -76,10 +76,12 @@ after downtime) is discovered and handled automatically.
 - **Built-in firewall** — allow/deny rules by IP, CIDR range, country
   or region, managed from the dashboard, enforced on all routes with a
   separate scope for the replication endpoints. Rules replicate
-  cluster-wide automatically.
+  cluster-wide automatically, and country rules work out of the box via
+  a bundled GeoIP database (IP geolocation by [DB-IP](https://db-ip.com)).
 - **Client world map** — the dashboard plots every unique client IP on
-  a world map (geolocated once via ip-api.com and cached), with blocked
-  clients in red and countries under a deny rule shaded.
+  a world map (geolocated once and cached — locally by default, or via
+  ip-api.com when enabled), with blocked clients in red and countries
+  under a deny rule shaded.
 - **Light on resources** — batched debounced pushes, periodic pulls,
   a single applier goroutine, oplog compaction and full garbage
   collection of all bookkeeping tables.
@@ -136,13 +138,16 @@ docker compose up --build
 | `IntegrityCheckAfterSync` | `true` | Run a relation-integrity scan (dangling reference check) after bulk syncs. |
 | `EventBufferSize` | `512` | Capacity of the in-memory replication event timeline. |
 | `DisableUIExtension` | `false` | Turn off the "Replication" tab injected into the admin UI. |
-| `GeoIPDBPath` | `""` | Path to a MaxMind-format `.mmdb` enabling country/region firewall rules. |
+| `GeoIPDBPath` | `""` | Custom MaxMind-format `.mmdb` for country/region firewall rules and client geolocation. A city-level database (GeoLite2-City, DB-IP City Lite) also enables region rules and map coordinates. When empty, the bundled DB-IP Country Lite database is used. |
+| `DisableEmbeddedGeoIP` | `false` | Don't load the bundled DB-IP country database (~8 MB RAM). Without any GeoIP database, country/region rules are ignored with a warning. |
 | `FirewallExemptSuperusers` | `true` | Superuser-authenticated requests bypass app-scope firewall rules (lock-out guard). |
-| `DisableIPGeolocation` | `false` | Turn off the automatic one-time geolocation of client IPs via ip-api.com (dashboard map). |
-| `IPAPIKey` | `""` | Optional ip-api.com paid ("pro") API key. When set, geolocation uses the HTTPS pro endpoint with a higher rate limit. |
+| `DisableIPGeolocation` | `false` | Turn off the automatic one-time geolocation of client IPs (dashboard map) entirely. |
+| `EnableIPAPIGeolocation` | `false` | Geolocate client IPs via the external [ip-api.com](https://ip-api.com) service (adds city + map coordinates) instead of the local GeoIP database. Off by default — no client IP leaves the node unless you opt in. |
+| `IPAPIKey` | `""` | Optional ip-api.com paid ("pro") API key. Implies `EnableIPAPIGeolocation` and uses the HTTPS pro endpoint with a higher rate limit. |
 
 The example app maps `PBR_NODE_URL`, `PBR_SEED_URL`,
-`PBR_CLUSTER_SECRET` and `PBR_GEOIP_DB` env vars to these fields.
+`PBR_CLUSTER_SECRET`, `PBR_GEOIP_DB`, `PBR_ENABLE_IPAPI` and
+`PBR_IPAPI_KEY` env vars to these fields.
 
 ### Behind a reverse proxy / NAT
 
@@ -186,17 +191,20 @@ login from the browser automatically). Two tabs:
   blue dots for allowed clients, red for clients with blocked requests,
   countries under an active deny rule shaded red, and blocked regions
   listed. Below the map, a searchable **client IP list**: click any IP
-  to see its full ip-api.com record and its top request paths with
-  per-path request/blocked counts — handy for spotting automated or
-  suspicious traffic. Each new public IP is geolocated **once** via
-  [ip-api.com](https://ip-api.com) and cached forever; private/loopback
-  addresses are counted but not located. The free endpoint is used by
-  default (rate-limited under its 45 req/min cap); set `IPAPIKey` to use
-  the paid HTTPS pro endpoint. Set `DisableIPGeolocation: true` to make
-  no outbound geolocation calls at all. Client IPs and paths are tracked
-  per node, kept for `TombstoneRetention` (capped at 10k IPs and 200
-  paths per IP), and correct client addresses behind a proxy require
-  PocketBase's trusted-proxy settings.
+  to see its geo record and its top request paths with per-path
+  request/blocked counts — handy for spotting automated or suspicious
+  traffic. Each new public IP is geolocated **once** and cached
+  forever; private/loopback addresses are counted but not located. By
+  default the lookup is **local**, against the same GeoIP database the
+  firewall uses (the bundled country database resolves the country;
+  a city-level `GeoIPDBPath` also yields city + map dots) — no client
+  IP ever leaves the node. Set `EnableIPAPIGeolocation: true` (or an
+  `IPAPIKey`) to use the external [ip-api.com](https://ip-api.com)
+  service instead for city-level map dots without a city database, or
+  `DisableIPGeolocation: true` to not geolocate at all. Client IPs and
+  paths are tracked per node, kept for `TombstoneRetention` (capped at
+  10k IPs and 200 paths per IP), and correct client addresses behind a
+  proxy require PocketBase's trusted-proxy settings.
 
 Firewall country/region rules are picked from a multi-select in the
 dashboard (search by name; one rule is created per selection), and the
@@ -229,10 +237,23 @@ rules by default, and the replication endpoints always require the
 cluster HMAC regardless of firewall rules (the firewall is
 defense-in-depth there, not the only gate).
 
-Country/region rules need a GeoIP database (e.g. the free GeoLite2
-Country/City `.mmdb` from MaxMind — license terms prevent bundling it):
-set `GeoIPDBPath` and restart. Without it those rules are inert and the
-dashboard shows a warning.
+**Country rules work out of the box**: the package bundles the free
+[DB-IP Country Lite](https://db-ip.com) database (CC BY 4.0 — "IP
+Geolocation by DB-IP"), refreshed automatically every month by CI so
+each release ships a current snapshot. **Region rules** need
+subdivision data that country-level databases don't carry: point
+`GeoIPDBPath` at a city-level `.mmdb` (e.g. MaxMind's free
+GeoLite2-City — its license prevents bundling — or DB-IP City Lite)
+and restart. A custom `GeoIPDBPath` always takes precedence over the
+bundled database, and `DisableEmbeddedGeoIP: true` skips loading it.
+
+A country/region rule that **cannot** match — no GeoIP database at
+all, or a region rule with a country-only database — is ignored
+("inert") rather than compiled, so a broken allow rule can't flip a
+scope into whitelist mode and lock everyone out. Every ignored rule is
+reported: a warning in the logs, in `GET
+/api/replication/firewall/summary` (`warnings`), and prominently in
+the dashboard's Firewall tab.
 
 ## How it works (short version)
 

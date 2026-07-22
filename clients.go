@@ -18,9 +18,13 @@ import (
 //
 // Every request's client IP is counted in memory (no per-request DB
 // write) and flushed to the node-local _repl_client_ips table in
-// batches. Each NEW public IP is geolocated exactly once via
-// ip-api.com (free endpoint, rate-limited well below its 45 req/min
-// cap) and the result is cached permanently in the table.
+// batches. Each NEW public IP is geolocated exactly once and the
+// result is cached permanently in the table. By default the lookup is
+// local, against the loaded GeoIP database (embedded DB-IP Country
+// Lite or Config.GeoIPDBPath) — no client IP ever leaves the node.
+// Only when Config.EnableIPAPIGeolocation (or an IPAPIKey) is set is
+// the external ip-api.com service used instead (free endpoint
+// rate-limited well below its 45 req/min cap).
 
 // geo_status values
 const (
@@ -238,21 +242,47 @@ func (r *Replicator) lookupGeoIPAPI(ip string) (*geoResult, error) {
 	return &out, nil
 }
 
-// geoLoop resolves pending IPs one by one, respecting ip-api.com's free
-// rate limit. Exactly one successful lookup is ever made per IP - the
-// result (or a permanent failure) is cached in the table.
+// lookupGeoMMDB resolves an IP locally from the loaded GeoIP database.
+// A country-level database yields no city/coordinates — the map lists
+// the client but cannot place a dot. With no database loaded at all
+// the IP is marked failed (never retried) instead of pending forever.
+func (r *Replicator) lookupGeoMMDB(ip string) (*geoResult, error) {
+	res := r.firewall.lookupClientGeo(ip)
+	if res == nil {
+		return &geoResult{Status: "fail"}, nil
+	}
+	return res, nil
+}
+
+// useIPAPI reports whether the external ip-api.com service is
+// explicitly enabled; otherwise geolocation stays local.
+func (r *Replicator) useIPAPI() bool {
+	return r.cfg.EnableIPAPIGeolocation || r.cfg.IPAPIKey != ""
+}
+
+// geoLoop resolves pending IPs one by one. Local (mmdb) lookups are
+// effectively free and drain fast; ip-api.com lookups respect the
+// service's free-tier rate limit. Exactly one successful lookup is
+// ever made per IP - the result (or a permanent failure) is cached in
+// the table.
 func (r *Replicator) geoLoop() {
 	defer r.wg.Done()
 
 	if r.cfg.DisableIPGeolocation {
 		return
 	}
-	if r.geoLookup == nil {
-		r.geoLookup = r.lookupGeoIPAPI
-	}
 
 	interval := geoLookupInterval
 	perTick := 1
+	if r.geoLookup == nil {
+		if r.useIPAPI() {
+			r.geoLookup = r.lookupGeoIPAPI
+		} else {
+			r.geoLookup = r.lookupGeoMMDB
+			interval = 500 * time.Millisecond
+			perTick = 200
+		}
+	}
 	if r.cfg.IPAPIKey != "" {
 		// paid key: drain the pending queue quickly
 		interval = time.Second
@@ -344,6 +374,7 @@ type clientsResponse struct {
 	BlockedCountries []string    `json:"blocked_countries"`
 	BlockedRegions   []string    `json:"blocked_regions"`
 	GeoEnabled       bool        `json:"geo_enabled"`
+	GeoSource        string      `json:"geo_source"` // "local db" | "ip-api" | "off"
 }
 
 func (r *Replicator) handleClients(e *core.RequestEvent) error {
@@ -354,9 +385,18 @@ func (r *Replicator) handleClients(e *core.RequestEvent) error {
 		return e.InternalServerError("failed to list clients", nil)
 	}
 
+	geoSource := "local db"
+	switch {
+	case r.cfg.DisableIPGeolocation:
+		geoSource = "off"
+	case r.useIPAPI():
+		geoSource = "ip-api"
+	}
+
 	resp := &clientsResponse{
 		Clients:    rows,
 		GeoEnabled: !r.cfg.DisableIPGeolocation,
+		GeoSource:  geoSource,
 	}
 
 	// active deny rules for the map overlay

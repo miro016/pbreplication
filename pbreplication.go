@@ -113,8 +113,20 @@ type Config struct {
 	DisableUIExtension bool
 
 	// GeoIPDBPath optionally points to a MaxMind-format .mmdb database
-	// used to resolve country/region firewall rules.
+	// used to resolve country/region firewall rules and to geolocate
+	// client IPs for the dashboard map. When empty, the embedded DB-IP
+	// Country Lite database is used, so country rules work out of the
+	// box. Point this at a city-level database (e.g. GeoLite2-City or
+	// DB-IP City Lite) to also enable region rules and city/coordinate
+	// resolution on the map.
 	GeoIPDBPath string
+
+	// DisableEmbeddedGeoIP skips loading the embedded DB-IP Country
+	// Lite database (~8 MB of memory). Without it and without a
+	// GeoIPDBPath, country/region firewall rules are ignored (a warning
+	// is logged and shown in the dashboard) and client IPs are not
+	// geolocated locally. Default: false.
+	DisableEmbeddedGeoIP bool
 
 	// FirewallExemptSuperusers lets requests with a valid superuser
 	// token bypass app-scope firewall rules so an admin can't lock
@@ -122,13 +134,21 @@ type Config struct {
 	FirewallExemptSuperusers *bool
 
 	// DisableIPGeolocation turns off the automatic geolocation of new
-	// client IPs via ip-api.com (used by the dashboard map). Client IPs
-	// are still counted; they just won't be located. Default: false.
+	// client IPs entirely (used by the dashboard map). Client IPs are
+	// still counted; they just won't be located. Default: false.
 	DisableIPGeolocation bool
 
-	// IPAPIKey is an optional ip-api.com paid ("pro") API key. When set,
-	// geolocation uses the HTTPS pro endpoint (higher rate limit, no
-	// public-network throttling). When empty the free endpoint is used.
+	// EnableIPAPIGeolocation switches client-IP geolocation to the
+	// external ip-api.com service, which adds city and coordinates
+	// (better map dots) at the cost of sending client IPs to a third
+	// party. Default: false — clients are resolved locally from the
+	// GeoIP database (embedded or GeoIPDBPath) and no external
+	// geolocation calls are ever made.
+	EnableIPAPIGeolocation bool
+
+	// IPAPIKey is an optional ip-api.com paid ("pro") API key. Setting
+	// it implies EnableIPAPIGeolocation and uses the HTTPS pro endpoint
+	// (higher rate limit, no public-network throttling).
 	IPAPIKey string
 
 	// RequestTimeout bounds a single node-to-node JSON request

@@ -88,7 +88,10 @@
     <div class="cards" id="fwCards"></div>
     <div class="hint">Explicit <b>deny</b> rules always win. As soon as a scope has at least one active <b>allow</b>
       rule it switches to whitelist mode (everything not allowed is blocked). Loopback requests and authenticated
-      superusers (app scope) are never blocked. Country/region rules need a GeoIP database configured on the server.</div>
+      superusers (app scope) are never blocked. Country rules work out of the box via the bundled
+      <a href="https://db-ip.com" target="_blank" rel="noopener">DB-IP</a> database; region rules need a
+      city-level GeoIP database configured on the server. Rules that cannot match (e.g. no region data)
+      are ignored and reported below.</div>
     <form class="addrule" onsubmit="return addRule(event)">
       <select id="ruAction"><option>deny</option><option>allow</option></select>
       <select id="ruScope"><option>app</option><option>replication</option></select>
@@ -116,11 +119,14 @@
 
   <section id="map" style="display:none">
     <div class="cards" id="mapCards"></div>
-    <div class="hint">Every unique client IP seen by this node, geolocated once via ip-api.com and cached.
+    <div class="hint">Every unique client IP seen by this node, geolocated once and cached —
+      locally by default (IP geolocation by <a href="https://db-ip.com" target="_blank" rel="noopener">DB-IP</a>),
+      or via ip-api.com when enabled in the config.
       <span style="color:var(--accent)">●</span> allowed clients,
       <span style="color:var(--bad)">●</span> clients with blocked requests.
       Countries with an active <b>deny</b> rule are shaded red; blocked regions are listed below.
-      Private/loopback addresses are counted but cannot be placed on the map.</div>
+      Private/loopback addresses — and clients located only to country level — are counted and listed
+      but cannot be placed as dots on the map.</div>
     <div class="card" style="padding:8px; position:relative">
       <canvas id="worldCanvas" style="width:100%; display:block"></canvas>
       <div id="mapTip" style="position:absolute; display:none; pointer-events:none; background:#1c2430; color:#fff;
@@ -364,7 +370,8 @@ async function refreshFirewall() {
       card('blocked requests', sum.blocked_total) +
       card('app scope', sum.whitelist_mode && sum.whitelist_mode.app ? 'whitelist' : 'blacklist') +
       card('replication scope', sum.whitelist_mode && sum.whitelist_mode.replication ? 'whitelist' : 'blacklist') +
-      card('GeoIP', sum.geoip_enabled ? 'enabled' : (sum.geoip_error ? 'error' : 'not configured'));
+      card('GeoIP', sum.geoip_enabled ? (sum.geoip_source === 'embedded' ? 'bundled' : 'custom') :
+        (sum.geoip_error ? 'error' : 'not available'));
     document.getElementById('ruleRows').innerHTML = (rules.items || []).map(r =>
       '<tr><td><span class="pill ' + (r.action === 'deny' ? 'bad' : 'ok') + '">' + esc(r.action) + '</span></td>' +
       '<td>' + esc(r.scope) + '</td><td>' + esc(r.match_type) + '</td>' +
@@ -372,7 +379,9 @@ async function refreshFirewall() {
       '<td><button onclick="toggleRule(\'' + r.id + '\',' + !r.active + ')">' + (r.active ? 'on' : 'off') + '</button></td>' +
       '<td><button onclick="deleteRule(\'' + r.id + '\')">delete</button></td></tr>').join('') ||
       '<tr><td colspan="7">No rules defined — everything is allowed.</td></tr>';
-    document.getElementById('fwErr').textContent = sum.geoip_error ? 'GeoIP: ' + sum.geoip_error : '';
+    const problems = (sum.warnings || []).slice();
+    if (sum.geoip_error && !sum.geoip_enabled) problems.unshift('GeoIP: ' + sum.geoip_error);
+    document.getElementById('fwErr').innerHTML = problems.map(w => '⚠ ' + esc(w)).join('<br>');
   } catch (err) {
     document.getElementById('fwErr').textContent = 'Firewall request failed: ' + err.message;
   }
@@ -449,7 +458,7 @@ async function refreshMap() {
       card('unique clients', clients.length) +
       card('geolocated', located.length) +
       card('blocked IPs', blockedIPs.length) +
-      card('geolocation', data.geo_enabled ? 'on' : 'off');
+      card('geolocation', data.geo_source || (data.geo_enabled ? 'on' : 'off'));
 
     const blockedCountries = [...new Set(data.blocked_countries || [])];
     const blockedRegions = [...new Set(data.blocked_regions || [])];
@@ -553,6 +562,7 @@ function drawMap(located, blockedCountries) {
 
   mapDots = [];
   for (const c of located) {
+    if (!c.lat && !c.lon) continue; // country-only geo: no dot to place
     const [x, y] = project(c.lon, c.lat, w, h);
     const bad = c.blocked > 0;
     ctx.beginPath();

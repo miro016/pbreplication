@@ -1,0 +1,71 @@
+name: update-geoip
+
+# Keeps the bundled GeoIP database current so every release ships a
+# fresh snapshot without users having to download anything manually.
+#
+# DB-IP publishes a new edition of the free Country Lite database
+# (CC BY 4.0, redistribution allowed with attribution) at the start of
+# every month. This workflow downloads it, verifies that the Go tests
+# still pass against it (the embedded-db tests do real lookups), and
+# commits it with a `fix(geoip): ...` message — which makes
+# release-please cut a patch release, so the update reaches users as a
+# normal module version bump.
+
+on:
+  schedule:
+    - cron: "0 4 3 * *" # monthly, on the 3rd (DB-IP publishes on the 1st)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-geoip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download latest DB-IP Country Lite
+        run: |
+          set -euo pipefail
+          edition="$(date -u +%Y-%m)"
+          url="https://download.db-ip.com/free/dbip-country-lite-${edition}.mmdb.gz"
+          echo "Downloading ${url}"
+          if ! curl -fsSL -o geoip/dbip-country-lite.mmdb.gz.new "$url"; then
+            # early in the month the new edition may not be up yet
+            edition="$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m)"
+            url="https://download.db-ip.com/free/dbip-country-lite-${edition}.mmdb.gz"
+            echo "Falling back to ${url}"
+            curl -fsSL -o geoip/dbip-country-lite.mmdb.gz.new "$url"
+          fi
+          gzip -t geoip/dbip-country-lite.mmdb.gz.new
+          echo "EDITION=${edition}" >> "$GITHUB_ENV"
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if cmp -s geoip/dbip-country-lite.mmdb.gz.new geoip/dbip-country-lite.mmdb.gz; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            rm geoip/dbip-country-lite.mmdb.gz.new
+          else
+            mv geoip/dbip-country-lite.mmdb.gz.new geoip/dbip-country-lite.mmdb.gz
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-go@v5
+        if: steps.diff.outputs.changed == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: Verify the new database (embedded-db tests do real lookups)
+        if: steps.diff.outputs.changed == 'true'
+        run: go test -run 'TestEmbeddedGeoDB|TestFirewall' ./...
+
+      - name: Commit and push
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add geoip/dbip-country-lite.mmdb.gz
+          git commit -m "fix(geoip): update bundled DB-IP country database to ${EDITION}"
+          git push

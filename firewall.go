@@ -1,6 +1,7 @@
 package pbreplication
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -57,8 +58,14 @@ type firewall struct {
 	// rule exists for it: anything not explicitly allowed is denied.
 	whitelistMode map[string]bool
 
-	geo    *maxminddb.Reader
-	geoErr string
+	geo       *maxminddb.Reader
+	geoErr    string
+	geoSource string // "file" (Config.GeoIPDBPath) or "embedded"
+	// warnings lists configuration problems detected on reload (e.g.
+	// country rules without a usable GeoIP database); surfaced in the
+	// dashboard so a rule that cannot take effect is never silent.
+	warnings    []string
+	lastWarnLog string
 }
 
 func newFirewall(r *Replicator) *firewall {
@@ -122,6 +129,13 @@ func (r *Replicator) bindFirewallHooks(app core.App) {
 
 // reload compiles all active rules into the in-memory ruleset (zero
 // per-request DB queries) and lazily opens the GeoIP database.
+//
+// Country/region rules that cannot possibly match — no GeoIP database
+// available, or region rules with a country-only database — are skipped
+// entirely ("inert") and reported via warnings instead of being
+// compiled. Compiling them anyway would be a lockout trap: an allow
+// rule that can never match flips its scope into whitelist mode and
+// then blocks every request.
 func (fw *firewall) reload(app core.App) {
 	records, err := app.FindAllRecords(firewallCollection)
 	if err != nil {
@@ -129,8 +143,12 @@ func (fw *firewall) reload(app core.App) {
 		return
 	}
 
+	fw.mu.Lock()
+	fw.ensureGeoLocked()
+
 	rules := make([]compiledRule, 0, len(records))
 	whitelist := map[string]bool{}
+	inertGeo, inertRegion := 0, 0
 
 	for _, rec := range records {
 		if !rec.GetBool("active") {
@@ -154,7 +172,21 @@ func (fw *firewall) reload(app core.App) {
 				continue
 			}
 			rule.ipnet = ipnet
-		case fwMatchCountry, fwMatchRegion:
+		case fwMatchCountry:
+			if fw.geo == nil {
+				inertGeo++
+				continue
+			}
+			rule.value = strings.ToUpper(rule.value)
+		case fwMatchRegion:
+			if fw.geo == nil {
+				inertGeo++
+				continue
+			}
+			if !geoHasRegions(fw.geo) {
+				inertRegion++
+				continue
+			}
 			rule.value = strings.ToUpper(rule.value)
 		default:
 			continue
@@ -165,19 +197,63 @@ func (fw *firewall) reload(app core.App) {
 		rules = append(rules, rule)
 	}
 
-	fw.mu.Lock()
+	warnings := []string{}
+	if inertGeo > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d country/region firewall rule(s) are IGNORED: no GeoIP database is available (set GeoIPDBPath or re-enable the embedded database)", inertGeo))
+	}
+	if inertRegion > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d region firewall rule(s) are IGNORED: the loaded GeoIP database (%s) has no region data — set GeoIPDBPath to a city-level .mmdb", inertRegion, fw.geo.Metadata.DatabaseType))
+	}
+	if fw.geoErr != "" && fw.geo != nil {
+		warnings = append(warnings, "custom GeoIP database failed to load ("+fw.geoErr+"), using the embedded one instead")
+	}
+
 	fw.rules = rules
 	fw.whitelistMode = whitelist
-	if fw.geo == nil && fw.r.cfg.GeoIPDBPath != "" {
-		geo, err := maxminddb.Open(fw.r.cfg.GeoIPDBPath)
-		if err != nil {
-			fw.geoErr = err.Error()
-		} else {
-			fw.geo = geo
-			fw.geoErr = ""
-		}
-	}
+	fw.warnings = warnings
+
+	joined := strings.Join(warnings, "; ")
+	logIt := joined != "" && joined != fw.lastWarnLog
+	fw.lastWarnLog = joined
 	fw.mu.Unlock()
+
+	if logIt {
+		fw.r.logWarn("firewall configuration warnings", "warnings", joined)
+	}
+}
+
+// ensureGeoLocked opens the GeoIP database once: a user-supplied file
+// (Config.GeoIPDBPath) takes precedence; otherwise — and as a fallback
+// when the file fails to load — the embedded DB-IP Country Lite
+// database is used, unless disabled. Requires fw.mu held (write).
+func (fw *firewall) ensureGeoLocked() {
+	if fw.geo != nil {
+		return
+	}
+	if path := fw.r.cfg.GeoIPDBPath; path != "" {
+		geo, err := maxminddb.Open(path)
+		if err == nil {
+			fw.geo = geo
+			fw.geoSource = "file"
+			fw.geoErr = ""
+			return
+		}
+		fw.geoErr = err.Error()
+	}
+	if fw.r.cfg.DisableEmbeddedGeoIP {
+		return
+	}
+	geo, err := openEmbeddedGeoDB()
+	if err != nil {
+		if fw.geoErr == "" {
+			fw.geoErr = err.Error()
+		}
+		return
+	}
+	fw.geo = geo
+	fw.geoSource = "embedded"
 }
 
 // ---------------------------------------------------------------------
@@ -302,6 +378,54 @@ func (fw *firewall) lookupGeoLocked(ip net.IP) (country, region string) {
 	return country, region
 }
 
+// lookupClientGeo resolves everything the client map can use (country,
+// region, city, coordinates) from the loaded GeoIP database. City and
+// coordinates stay empty with a country-level database. Returns nil
+// when no database is loaded or the IP is unparseable.
+func (fw *firewall) lookupClientGeo(ipStr string) *geoResult {
+	ip := net.ParseIP(ipStr)
+
+	fw.mu.RLock()
+	defer fw.mu.RUnlock()
+	if fw.geo == nil || ip == nil {
+		return nil
+	}
+
+	var rec struct {
+		Country struct {
+			ISOCode string `maxminddb:"iso_code"`
+		} `maxminddb:"country"`
+		Subdivisions []struct {
+			ISOCode string `maxminddb:"iso_code"`
+		} `maxminddb:"subdivisions"`
+		City struct {
+			Names map[string]string `maxminddb:"names"`
+		} `maxminddb:"city"`
+		Location struct {
+			Latitude  float64 `maxminddb:"latitude"`
+			Longitude float64 `maxminddb:"longitude"`
+		} `maxminddb:"location"`
+	}
+	if err := fw.geo.Lookup(ip, &rec); err != nil {
+		return nil
+	}
+
+	res := &geoResult{
+		Status:      "fail",
+		CountryCode: strings.ToUpper(rec.Country.ISOCode),
+		City:        rec.City.Names["en"],
+		Lat:         rec.Location.Latitude,
+		Lon:         rec.Location.Longitude,
+	}
+	if res.CountryCode != "" {
+		res.Status = "success"
+	}
+	if len(rec.Subdivisions) > 0 {
+		res.Region = strings.ToUpper(rec.Subdivisions[0].ISOCode)
+	}
+	return res
+}
+
 // ---------------------------------------------------------------------
 // dashboard summary
 
@@ -309,7 +433,10 @@ type firewallSummary struct {
 	RuleCount     int             `json:"rule_count"`
 	WhitelistMode map[string]bool `json:"whitelist_mode"`
 	GeoIPEnabled  bool            `json:"geoip_enabled"`
+	GeoIPSource   string          `json:"geoip_source,omitempty"` // "file" | "embedded"
+	GeoIPType     string          `json:"geoip_type,omitempty"`   // e.g. "DBIP-Country-Lite"
 	GeoIPError    string          `json:"geoip_error,omitempty"`
+	Warnings      []string        `json:"warnings"`
 	Blocked       int64           `json:"blocked_total"`
 	Collection    string          `json:"collection"`
 }
@@ -321,9 +448,14 @@ func (r *Replicator) handleFirewallSummary(e *core.RequestEvent) error {
 		RuleCount:     len(fw.rules),
 		WhitelistMode: map[string]bool{},
 		GeoIPEnabled:  fw.geo != nil,
+		GeoIPSource:   fw.geoSource,
 		GeoIPError:    fw.geoErr,
+		Warnings:      append([]string{}, fw.warnings...),
 		Blocked:       r.stats.blocked.Load(),
 		Collection:    firewallCollection,
+	}
+	if fw.geo != nil {
+		summary.GeoIPType = fw.geo.Metadata.DatabaseType
 	}
 	for k, v := range fw.whitelistMode {
 		summary.WhitelistMode[k] = v
