@@ -87,6 +87,22 @@ after downtime) is discovered and handled automatically.
   a single applier goroutine, oplog compaction and full garbage
   collection of all bookkeeping tables.
 
+## How it works?
+The core idea: every node keeps a normal PocketBase SQLite database, plus a small operation log. Whenever a record is created, updated, or deleted, that change is written to the log in the same SQLite transaction — so the log and the data can never disagree.
+
+How changes spread: nodes talk to each other over plain HTTP/JSON on PocketBase's own port (or the dedicated replication port), authenticated with an HMAC built from the shared cluster secret. Two mechanisms work together:
+
+Push — after a write, a node sends the new log entries to its peers (batched and debounced, so bursts of writes become few requests).
+Pull — on a fixed interval, every node also asks each peer "what do you have that I haven't seen?", exchanging progress vectors. So even if a push was missed (node down, network blip), the gap is repaired within one sync round.
+Conflict resolution: if the same record was changed on two nodes at once, last write wins. "Last" is decided by a hybrid logical clock (HLC) — a timestamp combining wall-clock time with a logical counter, so it stays correct even when servers' clocks drift a bit.
+
+Applying changes: incoming operations go through PocketBase's regular save/delete pipeline, which is why your hooks and realtime subscriptions still fire on every node, without causing replication loops.
+
+Joining: a new node only needs one existing member's URL and the secret. It copies the seed's whole database file for a fast start, then stays current via push/pull. The member list gossips automatically.
+
+Tech stack: pure Go, SQLite (via PocketBase), HTTP/JSON, HMAC signatures, hybrid logical clocks — no external broker, no Raft/consensus, no extra infrastructure. It's "eventually consistent": all nodes accept writes and converge to the same state within about one sync round.
+
+
 ## Try it (Docker)
 
 A ready-made 3-node demo cluster:
