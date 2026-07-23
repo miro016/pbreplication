@@ -5,9 +5,11 @@
 // last-update-wins semantics based on hybrid logical clocks. All
 // replication traffic rides on PocketBase's regular HTTP port under
 // /api/replication/*, authenticated with a shared cluster secret, so no
-// extra ports are needed. Nodes discover each other automatically: a
-// new node only needs the URL of one existing member (the "seed") and
-// the cluster secret.
+// extra ports are needed (optionally, Config.ReplicationBindAddr moves
+// the node-to-node endpoints to a dedicated — e.g. intranet-only —
+// address instead). Nodes discover each other automatically: a new
+// node only needs the URL of one existing member (the "seed") and the
+// cluster secret.
 //
 // Usage:
 //
@@ -150,6 +152,20 @@ type Config struct {
 	// it implies EnableIPAPIGeolocation and uses the HTTPS pro endpoint
 	// (higher rate limit, no public-network throttling).
 	IPAPIKey string
+
+	// ReplicationBindAddr optionally serves the node-to-node
+	// replication endpoints on their own address (e.g. ":8091" or
+	// "10.0.0.5:8091"), typically bound to a private/intranet
+	// interface, while the regular PocketBase port stays public. When
+	// set, the node-to-node endpoints (join/ping/ops/pull/file/
+	// snapshot/migrations) move ENTIRELY to this listener — the app
+	// port no longer serves them — and this node's NodeURL must point
+	// at the address peers can reach the listener on. The operator
+	// endpoints (dashboard, status, events, …) always stay on the app
+	// port. The listener speaks plain HTTP (put a proxy in front if
+	// the link needs TLS). Default: "" — everything is served on the
+	// PocketBase port, exactly as before.
+	ReplicationBindAddr string
 
 	// RequestTimeout bounds a single node-to-node JSON request
 	// (push/pull/join/meta pages). Streaming transfers (blobs, database
@@ -402,6 +418,11 @@ type Replicator struct {
 
 	firewall *firewall
 
+	// optional dedicated listener for the node-to-node endpoints
+	// (Config.ReplicationBindAddr)
+	replSrv *http.Server
+	replLn  net.Listener
+
 	stats struct {
 		applied   atomic.Int64
 		failed    atomic.Int64
@@ -475,6 +496,9 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
 		r.registerRoutes(se)
 		r.firewall.bindMiddleware(se)
+		if err := r.startReplicationListener(); err != nil {
+			return err
+		}
 		if !cfg.DisableUIExtension {
 			r.registerUIExtension(se)
 		}
@@ -619,6 +643,7 @@ func (r *Replicator) shutdown() {
 		close(r.stopCh)
 		r.runCancel()
 	})
+	r.stopReplicationListener()
 	r.wg.Wait()
 	if r.nodeID != "" {
 		_ = setState(r.app.NonconcurrentDB(), stateHLC, r.clock.Current())

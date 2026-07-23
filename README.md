@@ -33,7 +33,8 @@ after downtime) is discovered and handled automatically.
   tiebreak).
 - **No extra ports** — replication traffic uses PocketBase's regular
   HTTP(S) port under `/api/replication/*`, authenticated with an
-  HMAC derived from the cluster secret.
+  HMAC derived from the cluster secret. Optionally, a dedicated
+  intranet-only port for node-to-node traffic (`ReplicationBindAddr`).
 - **Autodiscovery** — a new node only knows one seed; the full member
   list gossips to everyone within one sync round.
 - **Hooks & realtime preserved** — replicated changes go through the
@@ -129,6 +130,7 @@ docker compose up --build
 | `DeferMigrationsUntilSynced` | `true` | Clustered nodes postpone the app's migrations on every start and coordinate with peers, running only migrations no member has applied (see below). |
 | `RequestTimeout` | `30s` | Deadline for one node-to-node JSON request. Streaming transfers (files, database chunks) use per-chunk deadlines instead of one global timeout. |
 | `MaxBodyBytes` | `16MB` | Max node-to-node request body buffered for HMAC verification. |
+| `ReplicationBindAddr` | `""` | Optional dedicated address for the node-to-node endpoints (e.g. `10.0.0.5:8091` on an intranet interface). When set, they are served **only** there — the public port keeps just the app + operator endpoints. Empty = everything on PocketBase's port (previous behavior). |
 | `FullCopyBootstrap` | `true` | New nodes bootstrap by copying the seed's whole database file instead of row-by-row sync (see below). |
 | `FullCopyChunkSize` | `8MB` | Chunk size for database snapshot downloads (each chunk retried independently). |
 | `FullCopyFallbackAfter` | `10m` | How long a failing full copy is retried before falling back to the logical sync. |
@@ -160,6 +162,30 @@ The example app maps `PBR_NODE_URL`, `PBR_SEED_URL`,
   ever needs to connect to it. It still appears on the dashboard.
 - Configure PocketBase's *trusted proxy headers* (Admin UI → Settings →
   Application) so the firewall sees real client IPs.
+
+### Dedicated replication port (public app / intranet cluster)
+
+When the app port is exposed to the internet but the cluster members
+share a private network, set `ReplicationBindAddr` to an intranet
+interface (e.g. `10.0.0.5:8091`). The node-to-node endpoints
+(join/ping/ops/pull/file/snapshot/migrations) then bind **only** there:
+the public port answers 404 for them, so replication traffic is
+unreachable from outside by construction (on top of the HMAC auth and
+the `replication`-scope firewall, which both keep working on the
+dedicated listener).
+
+- Set `NodeURL` to the address peers reach the listener on —
+  `http://10.0.0.5:8091` — since that is where this node now serves
+  replication. The operator endpoints (`/api/replication/dashboard`,
+  `/status`, …) stay on the app port.
+- The listener speaks plain HTTP, which is the normal choice inside a
+  private network; put a TLS proxy in front of it if the link crosses
+  untrusted infrastructure.
+- When switching an existing node over, update its `NodeURL` at the
+  same time — peers pick the new URL up automatically on the next
+  authenticated exchange.
+- Not set? Everything behaves exactly as before, on PocketBase's own
+  port.
 
 ## Dashboard
 

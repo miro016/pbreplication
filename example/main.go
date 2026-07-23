@@ -5,6 +5,9 @@
 //	PBR_NODE_URL        - this node's URL as reachable by OTHER nodes
 //	PBR_SEED_URL        - URL of any existing cluster member (empty on the first node)
 //	PBR_CLUSTER_SECRET  - shared cluster password (min 16 chars)
+//	PBR_REPL_ADDR       - optional dedicated bind address for the node-to-node
+//	                      replication endpoints (e.g. "10.0.0.5:8091" on an
+//	                      intranet interface); empty = PocketBase's own port
 //	PBR_GEOIP_DB        - optional custom MaxMind-format .mmdb (city-level enables
 //	                      region firewall rules); the bundled DB-IP country
 //	                      database is used when unset
@@ -31,6 +34,7 @@ func main() {
 		NodeURL:                os.Getenv("PBR_NODE_URL"),
 		SeedURL:                os.Getenv("PBR_SEED_URL"),
 		ClusterSecret:          os.Getenv("PBR_CLUSTER_SECRET"),
+		ReplicationBindAddr:    os.Getenv("PBR_REPL_ADDR"),
 		GeoIPDBPath:            os.Getenv("PBR_GEOIP_DB"),
 		EnableIPAPIGeolocation: os.Getenv("PBR_ENABLE_IPAPI") != "",
 		IPAPIKey:               os.Getenv("PBR_IPAPI_KEY"),
