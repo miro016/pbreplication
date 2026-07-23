@@ -6,26 +6,19 @@ import (
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/router"
 )
 
-// registerRoutes mounts all replication endpoints on PocketBase's own
-// HTTP router (no extra port needed).
+// registerRoutes mounts the replication endpoints on PocketBase's own
+// HTTP router. With a dedicated replication listener configured
+// (Config.ReplicationBindAddr), the node-to-node endpoints live ONLY
+// on that listener and the app port keeps just the operator endpoints.
 func (r *Replicator) registerRoutes(se *core.ServeEvent) {
 	g := se.Router.Group("/api/replication")
 
-	// --- node-to-node endpoints (cluster secret HMAC) ---
-	n := g.Group("")
-	n.BindFunc(r.requireClusterAuth)
-	n.POST("/join", r.handleJoin)
-	n.GET("/ping", r.handlePing)
-	n.POST("/ops", r.handleOps)
-	n.POST("/pull", r.handlePull)
-	n.GET("/file/{collection}/{recordId}/{filename}", r.handleFile)
-	n.GET("/snapshot/meta", r.serveSnapshotMeta)
-	n.GET("/snapshot/records", r.serveSnapshotRecords)
-	n.POST("/snapshot/db", r.handleDBSnapshotPrepare)
-	n.GET("/snapshot/db/chunk", r.handleDBSnapshotChunk)
-	n.GET("/migrations", r.handleMigrations)
+	if r.cfg.ReplicationBindAddr == "" {
+		r.registerNodeRoutes(g)
+	}
 
 	// --- admin endpoints ---
 	g.GET("/status", r.handleStatus).Bind(apis.RequireSuperuserAuth())
@@ -38,6 +31,24 @@ func (r *Replicator) registerRoutes(se *core.ServeEvent) {
 	g.GET("/world.json", r.handleWorldMap).Bind(apis.RequireSuperuserAuth())
 	g.GET("/countries.json", r.handleCountries).Bind(apis.RequireSuperuserAuth())
 	g.GET("/dashboard", r.handleDashboard) // HTML shell; its data calls require superuser auth
+}
+
+// registerNodeRoutes mounts the node-to-node endpoints (cluster secret
+// HMAC) on the given group — either the main router's group or the
+// dedicated replication listener's.
+func (r *Replicator) registerNodeRoutes(g *router.RouterGroup[*core.RequestEvent]) {
+	n := g.Group("")
+	n.BindFunc(r.requireClusterAuth)
+	n.POST("/join", r.handleJoin)
+	n.GET("/ping", r.handlePing)
+	n.POST("/ops", r.handleOps)
+	n.POST("/pull", r.handlePull)
+	n.GET("/file/{collection}/{recordId}/{filename}", r.handleFile)
+	n.GET("/snapshot/meta", r.serveSnapshotMeta)
+	n.GET("/snapshot/records", r.serveSnapshotRecords)
+	n.POST("/snapshot/db", r.handleDBSnapshotPrepare)
+	n.GET("/snapshot/db/chunk", r.handleDBSnapshotChunk)
+	n.GET("/migrations", r.handleMigrations)
 }
 
 // handlePing answers reachability callbacks.
