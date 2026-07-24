@@ -15,7 +15,11 @@ import (
 
 // applyLoop is the single goroutine that applies remote ops. Serializing
 // applies keeps LWW bookkeeping simple and matches SQLite's single-writer
-// model anyway.
+// model anyway. Queued ops are drained in FIFO batches so consecutive
+// record ops share one SQLite transaction (applyRecordBatch) — a
+// transaction per op caps a follower's apply throughput far below what
+// a loaded peer produces, backing the queue up until interactive
+// writes take dozens of seconds to propagate.
 func (r *Replicator) applyLoop() {
 	defer r.wg.Done()
 	for {
@@ -23,14 +27,181 @@ func (r *Replicator) applyLoop() {
 		case <-r.stopCh:
 			return
 		case o := <-r.applyCh:
-			if err := r.applyOp(o); err != nil {
-				r.stats.failed.Add(1)
-				r.logError(fmt.Sprintf("apply %s %s/%s (from %s#%d)", o.Type, o.ColName, o.RecordID, o.SrcNode, o.SrcSeq), err,
-					"peer", o.SrcNode, "collection", o.ColName)
-				r.emitOpFailed(o, err)
-			}
+			r.applyBatch(r.drainApplyQueue(o))
 		}
 	}
+}
+
+// applyQueueCap sizes the apply queue to the batch size: a
+// batch-draining applier with a too-small queue can't accumulate
+// batches worth applying together.
+func applyQueueCap(batch int) int {
+	if c := 4 * batch; c > 4096 {
+		return c
+	}
+	return 4096
+}
+
+// drainApplyQueue greedily collects ops already queued behind first —
+// without blocking — up to the configured batch size, preserving FIFO
+// order.
+func (r *Replicator) drainApplyQueue(first *op) []*op {
+	batch := []*op{first}
+	for len(batch) < r.cfg.ApplyBatch {
+		select {
+		case o := <-r.applyCh:
+			batch = append(batch, o)
+		default:
+			return batch
+		}
+	}
+	return batch
+}
+
+// applyBatch applies a FIFO slice of ops. Consecutive record ops are
+// grouped into a shared transaction; collection (schema) ops act as
+// barriers: the pending record group is flushed first and the
+// collection op is applied on its own, so schema changes are never
+// reordered relative to the record ops around them.
+func (r *Replicator) applyBatch(ops []*op) {
+	pending := make([]*op, 0, len(ops))
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		r.applyRecordBatch(pending)
+		pending = pending[:0]
+	}
+
+	for _, o := range ops {
+		r.clock.Observe(o.HLC)
+		if o.SrcNode == r.nodeID {
+			continue // own op echoed back through gossip
+		}
+		switch o.Type {
+		case opColUpsert, opColDelete:
+			flush()
+			if err := r.applyCollectionOp(o); err != nil {
+				r.reportApplyError(o, err)
+			}
+		case opUpsert, opDelete:
+			pending = append(pending, o)
+		default:
+			r.reportApplyError(o, fmt.Errorf("unknown op type %q", o.Type))
+		}
+	}
+	flush()
+}
+
+// applyRecordBatch applies a group of record ops inside ONE write
+// transaction, with the authoritative per-record LWW gate still
+// evaluated inside the transaction (the same pattern as
+// applySnapshotBatch). If the shared transaction fails, every op of
+// the group is retried individually through the applyOp path, so a
+// single poisoned op cannot sink its neighbours and the failure is
+// logged and surfaced for exactly the offending op.
+func (r *Replicator) applyRecordBatch(ops []*op) {
+	// Resolve collections, park ops whose collection isn't known yet
+	// and prefetch missing file blobs — all BEFORE the write
+	// transaction (fetchFilesForOp does network IO).
+	type entry struct {
+		o   *op
+		col *core.Collection
+	}
+	entries := make([]entry, 0, len(ops))
+	for _, o := range ops {
+		col := r.resolveCollection(o)
+		if col == nil {
+			r.parkPending(o)
+			continue
+		}
+		if !r.isReplicated(col) {
+			continue
+		}
+		if o.Type == opUpsert && len(o.Files) > 0 {
+			// cheap staleness pre-check so blobs aren't fetched for ops
+			// that already lost their LWW race
+			cur, err := getVersion(r.app.DB(), o.ColID, o.RecordID)
+			if err == nil && !supersedes(o, cur) {
+				continue
+			}
+			r.fetchFilesForOp(o, col)
+		}
+		entries = append(entries, entry{o, col})
+	}
+	if len(entries) == 0 {
+		return
+	}
+
+	applied := 0
+	err := r.app.RunInTransaction(func(txApp core.App) error {
+		db := txApp.NonconcurrentDB()
+		for _, e := range entries {
+			o := e.o
+
+			// authoritative LWW gate inside the tx
+			cur, err := getVersion(db, o.ColID, o.RecordID)
+			if err != nil {
+				return err
+			}
+			if !supersedes(o, cur) {
+				continue
+			}
+
+			rec, err := txApp.FindRecordById(e.col, o.RecordID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			ctx := markedCtx(context.Background(), o)
+
+			switch o.Type {
+			case opUpsert:
+				if rec == nil {
+					rec = core.NewRecord(e.col)
+					rec.Id = o.RecordID
+				}
+				if err := applyPayload(rec, o.Payload); err != nil {
+					return err
+				}
+				if err := txApp.SaveNoValidateWithContext(ctx, rec); err != nil {
+					return err
+				}
+			case opDelete:
+				if rec != nil {
+					if err := txApp.DeleteWithContext(ctx, rec); err != nil {
+						return err
+					}
+				}
+			}
+
+			if err := upsertVersion(db, o.ColID, o.RecordID, o.HLC, o.SrcNode, o.Type == opDelete); err != nil {
+				return err
+			}
+			applied++
+		}
+		return nil
+	})
+	if err == nil {
+		r.stats.applied.Add(int64(applied))
+		return
+	}
+
+	// per-op fallback: the batch rolled back as a whole, so replay it
+	// op by op to isolate the poisoned one(s)
+	for _, e := range entries {
+		if err := r.applyOp(e.o); err != nil {
+			r.reportApplyError(e.o, err)
+		}
+	}
+}
+
+// reportApplyError records a failed op application in the stats, the
+// structured log and the (throttled) event timeline.
+func (r *Replicator) reportApplyError(o *op, err error) {
+	r.stats.failed.Add(1)
+	r.logError(fmt.Sprintf("apply %s %s/%s (from %s#%d)", o.Type, o.ColName, o.RecordID, o.SrcNode, o.SrcSeq), err,
+		"peer", o.SrcNode, "collection", o.ColName)
+	r.emitOpFailed(o, err)
 }
 
 // emitOpFailed puts an apply failure on the event timeline, throttled
