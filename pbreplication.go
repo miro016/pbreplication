@@ -82,6 +82,13 @@ type Config struct {
 	// MaxBatch limits ops per push/pull page. Default: 500.
 	MaxBatch int
 
+	// ApplyBatch caps how many queued remote ops the applier drains at
+	// once and applies inside a single SQLite transaction. Batching
+	// amortises the per-transaction cost that otherwise limits how fast
+	// a node can absorb a peer's bulk writes; ordering (FIFO) and the
+	// per-record LWW gate are unchanged. Default: 200.
+	ApplyBatch int
+
 	// TombstoneRetention is how long delete markers are kept. It must
 	// exceed the longest planned node downtime; nodes offline for
 	// longer automatically fall back to a full snapshot resync.
@@ -239,6 +246,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.MaxBatch <= 0 {
 		c.MaxBatch = 500
+	}
+	if c.ApplyBatch <= 0 {
+		c.ApplyBatch = 200
 	}
 	if c.TombstoneRetention <= 0 {
 		c.TombstoneRetention = 720 * time.Hour
@@ -460,7 +470,7 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 		runCancel:   runCancel,
 		pushWake:    make(chan struct{}, 1),
 		pullWake:    make(chan struct{}, 1),
-		applyCh:     make(chan *op, 4096),
+		applyCh:     make(chan *op, applyQueueCap(cfg.ApplyBatch)),
 		stopCh:      make(chan struct{}),
 		pushCursors: map[string]int64{},
 		excluded:    map[string]bool{},

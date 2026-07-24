@@ -146,6 +146,7 @@ docker compose up --build
 | `DeferMigrationsUntilSynced` | `true` | Clustered nodes postpone the app's migrations on every start and coordinate with peers, running only migrations no member has applied (see below). |
 | `RequestTimeout` | `30s` | Deadline for one node-to-node JSON request. Streaming transfers (files, database chunks) use per-chunk deadlines instead of one global timeout. |
 | `MaxBodyBytes` | `16MB` | Max node-to-node request body buffered for HMAC verification. |
+| `ApplyBatch` | `200` | Max remote ops applied per SQLite transaction on the receiving node. Batching amortises per-transaction cost when absorbing a peer's bulk writes; FIFO order and per-record LWW checks are unchanged. |
 | `ReplicationBindAddr` | `""` | Optional dedicated address for the node-to-node endpoints (e.g. `10.0.0.5:8091` on an intranet interface). When set, they are served **only** there — the public port keeps just the app + operator endpoints. Empty = everything on PocketBase's port (previous behavior). |
 | `FullCopyBootstrap` | `true` | New nodes bootstrap by copying the seed's whole database file instead of row-by-row sync (see below). |
 | `FullCopyChunkSize` | `8MB` | Chunk size for database snapshot downloads (each chunk retried independently). |
