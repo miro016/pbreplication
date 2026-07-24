@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.0](https://github.com/miro016/pbreplication/compare/v0.4.2...v0.5.0) (2026-07-24)
+
+
+### Features
+
+* **apply:** batch remote-op application into shared transactions ([86c2193](https://github.com/miro016/pbreplication/commit/86c219337dd6e742353f54b144a3f058628d6923))
+* **apply:** batch remote-op application into shared transactions ([c05fc03](https://github.com/miro016/pbreplication/commit/c05fc03f68ebfd1ffd82b1d9778d7367949a9341))
+* **firewall:** bundled GeoIP db, inert-rule warnings, local client geolocation ([71f389f](https://github.com/miro016/pbreplication/commit/71f389f1ad4bd2c3e5df3d743bc5474349fcc44f))
+* optional dedicated port for node-to-node replication traffic ([a85082d](https://github.com/miro016/pbreplication/commit/a85082d027f34a35472e264f8938036254939517))
+
 ## [0.4.2](https://github.com/miro016/pbreplication/compare/v0.4.1...v0.4.2) (2026-07-20)
 
 
