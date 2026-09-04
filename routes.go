@@ -166,14 +166,19 @@ func (r *Replicator) handlePull(e *core.RequestEvent) error {
 
 	r.noteSender(req.Sender)
 
-	ops, snapshotRequired, err := opsAfterVector(r.app.DB(), req.Vector, req.Limit)
-	if err != nil {
-		return e.InternalServerError("failed to read oplog", nil)
-	}
-
+	// Capture the advertised upper bound before reading the page. A write that
+	// commits concurrently may then appear in Ops while being above Vector,
+	// which is safe (the receiver ingests it normally). Doing this in the
+	// opposite order could advertise a sequence that wasn't included and let a
+	// receiver skip it when adopting the vector at the end of a pull.
 	vector, err := r.currentVector()
 	if err != nil {
 		return e.InternalServerError("failed to compute vector", nil)
+	}
+
+	ops, snapshotRequired, err := opsAfterVector(r.app.DB(), req.Vector, req.Limit)
+	if err != nil {
+		return e.InternalServerError("failed to read oplog", nil)
 	}
 	members, _ := listMembers(r.app.DB(), false)
 
