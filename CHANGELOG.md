@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/miro016/pbreplication/compare/v0.5.0...v0.5.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* paginate pulls across compacted oplog gaps ([92b7d09](https://github.com/miro016/pbreplication/commit/92b7d09ac5458dbf5e57336bf9f6a6fecc3778d5))
+* paginate pulls across compacted oplog gaps ([1b76d02](https://github.com/miro016/pbreplication/commit/1b76d02ce5e71af8b3bb8a23c5beb5c9d4e0a46a))
+
 ## [0.5.0](https://github.com/miro016/pbreplication/compare/v0.4.2...v0.5.0) (2026-07-24)
 
 
