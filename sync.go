@@ -86,11 +86,14 @@ func (r *Replicator) ingestOps(ops []*op) error {
 		if o.SrcNode == "" || o.SrcSeq <= 0 || o.SrcNode == r.nodeID {
 			continue
 		}
-		if err := insertOp(db, o); err != nil {
+		inserted, err := insertOpIfAbsent(db, o)
+		if err != nil {
 			return err
 		}
 		touched[o.SrcNode] = true
-		r.enqueueApply(o)
+		if inserted {
+			r.enqueueApply(o)
+		}
 	}
 
 	gap := false
@@ -400,13 +403,13 @@ func (r *Replicator) maybeLogLagSummary() {
 func (r *Replicator) pullFromPeer(m *member) error {
 	pulled := 0
 	progressShown := false
-	for {
-		vector, err := r.currentVector()
-		if err != nil {
-			return err
-		}
+	pullVector, err := r.currentVector()
+	if err != nil {
+		return err
+	}
 
-		req := &pullRequest{Sender: r.senderInfo(), Vector: vector, Limit: r.cfg.MaxBatch}
+	for {
+		req := &pullRequest{Sender: r.senderInfo(), Vector: pullVector, Limit: r.cfg.MaxBatch}
 		var resp pullResponse
 		if err := r.callPeer(r.peerURL(m), http.MethodPost, "/api/replication/pull", req, &resp); err != nil {
 			if progressShown {
@@ -433,14 +436,12 @@ func (r *Replicator) pullFromPeer(m *member) error {
 			}
 			return err
 		}
-		pulled += len(resp.Ops)
-
-		if len(resp.Ops) < r.cfg.MaxBatch {
+		if len(resp.Ops) == 0 {
 			// Complete pull: adopt the peer's vector. Safe because the
 			// peer's vector covers exactly the effects contained in the
-			// ops it retains (superseded ops it compacted away are, by
-			// definition, covered by newer ops we just ingested). This
-			// also lets the vector move past holes left by compaction.
+			// retained ops paged through above (superseded ops it compacted
+			// away are covered by newer retained ops). This also lets the
+			// persisted contiguous vector move past compaction holes.
 			if pulled > 0 {
 				r.logPulled(m.NodeID, pulled, progressShown)
 			}
@@ -448,11 +449,41 @@ func (r *Replicator) pullFromPeer(m *member) error {
 			return nil
 		}
 
-		// a full page means more updates are still waiting on the peer -
-		// show a live, in-place progress line for the larger catch-up
-		r.consoleProgress("pulling updates from %s: %d ops...", m.NodeID, pulled)
-		progressShown = true
+		// The persisted vector advances only across contiguous sequences,
+		// but compaction deliberately leaves harmless holes where an older
+		// operation was superseded. Keep a per-pull pagination vector so a
+		// hole cannot make every request fetch the same page forever.
+		if !advancePullVector(pullVector, resp.Ops) {
+			if progressShown {
+				r.consoleProgressDone("pull from %s stopped after %d ops: cursor made no progress", m.NodeID, pulled)
+			}
+			return fmt.Errorf("pull from %s returned %d ops without advancing the cursor", m.NodeID, len(resp.Ops))
+		}
+		pulled += len(resp.Ops)
+
+		if len(resp.Ops) >= r.cfg.MaxBatch {
+			// A full page commonly means more updates are waiting. An empty
+			// follow-up page is the authoritative completion signal; relying
+			// on a short page would be unsafe when peers use different limits.
+			r.consoleProgress("pulling updates from %s: %d ops...", m.NodeID, pulled)
+			progressShown = true
+		}
 	}
+}
+
+// advancePullVector moves the transient pagination cursor to the highest
+// sequence actually returned for each source. It intentionally does not write
+// _repl_state: only a completed pull may adopt a vector across compaction gaps.
+func advancePullVector(vector map[string]int64, ops []*op) bool {
+	advanced := false
+	for _, o := range ops {
+		if o == nil || o.SrcNode == "" || o.SrcSeq <= vector[o.SrcNode] {
+			continue
+		}
+		vector[o.SrcNode] = o.SrcSeq
+		advanced = true
+	}
+	return advanced
 }
 
 // logPulled reports that ongoing anti-entropy pulled fresh ops from a

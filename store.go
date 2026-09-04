@@ -251,12 +251,20 @@ func incrLocalSeq(db dbx.Builder) (int64, error) {
 // oplog
 
 func insertOp(db dbx.Builder, o *op) error {
+	_, err := insertOpIfAbsent(db, o)
+	return err
+}
+
+// insertOpIfAbsent stores o and reports whether it was newly inserted.
+// Callers ingesting remote pages use the result to avoid repeatedly
+// scheduling an already-applied operation when peers retry a request.
+func insertOpIfAbsent(db dbx.Builder, o *op) (bool, error) {
 	files := ""
 	if len(o.Files) > 0 {
 		b, _ := json.Marshal(o.Files)
 		files = string(b)
 	}
-	_, err := db.NewQuery(`INSERT OR IGNORE INTO _repl_oplog
+	result, err := db.NewQuery(`INSERT OR IGNORE INTO _repl_oplog
 		(src_node, src_seq, hlc, op_type, col_id, col_name, record_id, payload, files, created)
 		VALUES ({:sn}, {:ss}, {:hlc}, {:t}, {:cid}, {:cn}, {:rid}, {:p}, {:f}, {:c})`).
 		Bind(dbx.Params{
@@ -264,7 +272,11 @@ func insertOp(db dbx.Builder, o *op) error {
 			"cid": o.ColID, "cn": o.ColName, "rid": o.RecordID,
 			"p": string(o.Payload), "f": files, "c": nowStr(),
 		}).Execute()
-	return err
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
 }
 
 // opsAfterRowID returns ops with rowid > cursor, ordered by rowid.
