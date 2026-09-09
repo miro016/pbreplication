@@ -41,6 +41,7 @@ func (r *Replicator) registerNodeRoutes(g *router.RouterGroup[*core.RequestEvent
 	n.BindFunc(r.requireClusterAuth)
 	n.POST("/join", r.handleJoin)
 	n.GET("/ping", r.handlePing)
+	n.POST("/identity/check", r.handleIdentityCheck)
 	n.POST("/ops", r.handleOps)
 	n.POST("/pull", r.handlePull)
 	n.GET("/file/{collection}/{recordId}/{filename}", r.handleFile)
@@ -53,7 +54,10 @@ func (r *Replicator) registerNodeRoutes(g *router.RouterGroup[*core.RequestEvent
 
 // handlePing answers reachability callbacks.
 func (r *Replicator) handlePing(e *core.RequestEvent) error {
-	return e.JSON(http.StatusOK, map[string]string{"node_id": r.nodeID})
+	return e.JSON(http.StatusOK, &identityPing{
+		NodeID:     r.nodeID,
+		InstanceID: r.instanceID,
+	})
 }
 
 // handleJoin registers a (re)joining node and hands it the current
@@ -78,6 +82,20 @@ func (r *Replicator) handleJoin(e *core.RequestEvent) error {
 		r.emitEvent(EventDuplicateNode, "join rejected: another node uses this node's id (cloned data directory?)",
 			"peer", req.NodeID, "url", req.URL)
 		return e.Error(http.StatusConflict, "duplicate node id: this id belongs to the receiving node", nil)
+	}
+	// Also reject an id owned by any other currently active cluster member.
+	// The callback's process-unique instance id allows the real member to
+	// reannounce itself after a restart without being mistaken for a duplicate.
+	if req.NodeID != r.nodeID && req.InstanceID != "" {
+		owner, err := getMember(r.app.DB(), req.NodeID)
+		if err != nil {
+			return e.InternalServerError("failed to inspect cluster membership", nil)
+		}
+		if owner != nil && !owner.Removed {
+			if inUse, kind := r.registeredIdentityInUse(owner, req.InstanceID, req.URL); inUse {
+				return r.identityConflict(e, req.NodeID, kind)
+			}
+		}
 	}
 
 	reachable := false

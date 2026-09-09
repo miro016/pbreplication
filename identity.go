@@ -3,8 +3,10 @@ package pbreplication
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pocketbase/dbx"
@@ -42,6 +44,133 @@ import (
 // process already uses this node's persistent id (the typical aftermath
 // of cloning a pb_data directory).
 var errDuplicateNodeID = errors.New("duplicate node id in cluster")
+
+const identityCheckPath = "/api/replication/identity/check"
+
+// identityCheckRequest is used before a node exposes any listener or starts
+// replication workers. Fresh nodes may not reuse any registered member name;
+// restarting nodes may reclaim their persisted name only when no live process
+// currently answers for it.
+type identityCheckRequest struct {
+	NodeID     string `json:"node_id"`
+	InstanceID string `json:"instance_id"`
+	URL        string `json:"url,omitempty"`
+	Fresh      bool   `json:"fresh"`
+}
+
+type identityPing struct {
+	NodeID     string `json:"node_id"`
+	InstanceID string `json:"instance_id,omitempty"`
+}
+
+// checkStrictNodeID asks the seed to prove that the configured identity is
+// available. Any failure is fatal in strict mode: starting without a positive
+// answer would make uniqueness dependent on a race or a stale local database.
+func (r *Replicator) checkStrictNodeID(fresh bool) error {
+	if !r.cfg.StrictNodeID || r.cfg.SeedURL == "" {
+		return nil
+	}
+	nodeID := r.nodeID
+	if nodeID == "" {
+		nodeID = r.cfg.NodeID
+	}
+	req := &identityCheckRequest{
+		NodeID:     nodeID,
+		InstanceID: r.instanceID,
+		URL:        r.cfg.NodeURL,
+		Fresh:      fresh,
+	}
+	if err := r.callPeer(r.cfg.SeedURL, http.MethodPost, identityCheckPath, req, nil); err != nil {
+		if httpStatus(err) == http.StatusConflict {
+			return fmt.Errorf("%w: configured node id %q is already in use", errDuplicateNodeID, nodeID)
+		}
+		if httpStatus(err) == http.StatusNotFound || httpStatus(err) == http.StatusMethodNotAllowed {
+			return fmt.Errorf("pbreplication: strict node-id check is not supported by seed %s; upgrade the seed before starting this node", r.cfg.SeedURL)
+		}
+		return fmt.Errorf("pbreplication: cannot verify configured node id %q with seed %s: %w", nodeID, r.cfg.SeedURL, err)
+	}
+	return nil
+}
+
+// handleIdentityCheck answers a strict joiner's pre-start ownership check.
+// It deliberately does not reserve or mutate membership; the normal join does
+// that after the joining process has started listening.
+func (r *Replicator) handleIdentityCheck(e *core.RequestEvent) error {
+	req := &identityCheckRequest{}
+	if err := e.BindBody(req); err != nil || req.NodeID == "" || req.InstanceID == "" {
+		return e.BadRequestError("invalid identity check request", nil)
+	}
+
+	if req.NodeID == r.nodeID {
+		// A proxy may route the request back to this same process. Only the
+		// process-unique instance id makes that a valid self-check.
+		if req.InstanceID == r.instanceID {
+			return e.JSON(http.StatusOK, map[string]bool{"available": true})
+		}
+		return r.identityConflict(e, req.NodeID, "seed")
+	}
+
+	owner, err := getMember(r.app.DB(), req.NodeID)
+	if err != nil {
+		return e.InternalServerError("failed to inspect cluster membership", nil)
+	}
+	if owner == nil || owner.Removed {
+		return e.JSON(http.StatusOK, map[string]bool{"available": true})
+	}
+
+	// A fresh database has no continuity proof and must not take even an
+	// offline member's name. Operators can explicitly remove the old member or
+	// choose another id.
+	if req.Fresh {
+		return r.identityConflict(e, req.NodeID, "registered member")
+	}
+
+	inUse, kind := r.registeredIdentityInUse(owner, req.InstanceID, req.URL)
+	if inUse {
+		return r.identityConflict(e, req.NodeID, kind)
+	}
+	return e.JSON(http.StatusOK, map[string]bool{"available": true})
+}
+
+// registeredIdentityInUse distinguishes a legitimate restart from a second
+// live process claiming the same persisted member. A positive callback is
+// authoritative. When callback verification fails, recent authenticated
+// traffic remains conservative evidence that the old owner is still alive.
+func (r *Replicator) registeredIdentityInUse(owner *member, joiningInstanceID, joiningURL string) (bool, string) {
+	if owner.URL != "" {
+		ctx, cancel := context.WithTimeout(r.runCtx, min(r.cfg.RequestTimeout, 5*time.Second))
+		defer cancel()
+		ping := &identityPing{}
+		err := r.callPeerCtx(ctx, owner.URL, http.MethodGet, "/api/replication/ping", nil, ping)
+		if err == nil && ping.NodeID == owner.NodeID {
+			if ping.InstanceID == "" || ping.InstanceID != joiningInstanceID {
+				return true, "active member"
+			}
+			return false, ""
+		}
+		// The same advertised address no longer answers, so this is the normal
+		// immediate-restart case. It need not wait for the membership health TTL.
+		if strings.TrimRight(joiningURL, "/") == strings.TrimRight(owner.URL, "/") {
+			return false, ""
+		}
+	}
+	if r.isHealthy(owner) {
+		kind := "recently active member"
+		if owner.URL == "" {
+			kind = "active pull-only member"
+		}
+		return true, kind
+	}
+	return false, ""
+}
+
+func (r *Replicator) identityConflict(e *core.RequestEvent, nodeID, owner string) error {
+	r.logWarn("node identity check rejected: id is already taken",
+		"node", nodeID, "owner", owner)
+	r.emitEvent(EventDuplicateNode, "node identity check rejected: id is already taken",
+		"node", nodeID, "owner", owner)
+	return e.Error(http.StatusConflict, "node id is already taken in this cluster", nil)
+}
 
 // flagDuplicateNodeID persists the detection so the NEXT process start
 // regenerates this node's identity before serving. seedAck is how far

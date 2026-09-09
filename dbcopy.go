@@ -79,6 +79,15 @@ func (r *Replicator) maybeFullCopyBootstrap(app core.App) error {
 		r.logError("full copy: strategy decision failed - continuing with normal startup", err)
 		return nil
 	}
+	if r.cfg.StrictNodeID {
+		// Check every clustered start before PocketBase opens the database or runs
+		// migrations. Fresh nodes are additionally forbidden from reusing an
+		// offline member name. Doing this here also avoids building and transferring
+		// a large snapshot for a name that cannot join.
+		if err := r.checkStrictNodeID(strategy == strategyFreshCopy); err != nil {
+			return err
+		}
+	}
 	if strategy == strategyNone {
 		return nil
 	}
@@ -147,7 +156,7 @@ func (r *Replicator) fullCopyBootstrap(app core.App, strategy copyStrategy) erro
 			return nil
 		} else {
 			lastErr = err
-			if errors.Is(err, errFullCopyUnsupported) {
+			if errors.Is(err, errFullCopyUnsupported) || errors.Is(err, errDuplicateNodeID) {
 				return err
 			}
 			r.logWarn("full copy attempt failed (will retry)", "error", err.Error())

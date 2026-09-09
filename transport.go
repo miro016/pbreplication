@@ -36,8 +36,14 @@ func signPayload(secret, nodeID, ts, method, path string, body []byte) string {
 // signRequest sets the replication Authorization header.
 func (r *Replicator) signRequest(req *http.Request, body []byte) {
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	mac := signPayload(r.cfg.ClusterSecret, r.nodeID, ts, req.Method, req.URL.Path, body)
-	req.Header.Set("Authorization", fmt.Sprintf("%s %s.%s.%s", authScheme, r.nodeID, ts, mac))
+	nodeID := r.nodeID
+	if nodeID == "" {
+		// Strict fresh-node identity checks happen before the copied database is
+		// installed and initStorage has populated r.nodeID.
+		nodeID = r.cfg.NodeID
+	}
+	mac := signPayload(r.cfg.ClusterSecret, nodeID, ts, req.Method, req.URL.Path, body)
+	req.Header.Set("Authorization", fmt.Sprintf("%s %s.%s.%s", authScheme, nodeID, ts, mac))
 }
 
 // verifyAuth validates the replication Authorization header and returns
@@ -95,7 +101,9 @@ func (r *Replicator) requireClusterAuth(e *core.RequestEvent) error {
 	if err != nil {
 		return e.UnauthorizedError("cluster authentication failed", nil)
 	}
-	if nodeID != r.nodeID {
+	// An identity availability probe must not refresh an existing member with
+	// the caller's claimed id before ownership has been established.
+	if nodeID != r.nodeID && e.Request.URL.Path != identityCheckPath {
 		_ = touchMember(r.app.NonconcurrentDB(), nodeID)
 	}
 	e.Set(ctxCallerNodeID, nodeID)

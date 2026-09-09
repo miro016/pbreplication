@@ -72,6 +72,14 @@ type Config struct {
 	// generated on first start and persisted in the database.
 	NodeID string
 
+	// StrictNodeID makes a configured NodeID an exclusive cluster identity.
+	// Before a fresh copy and again before serving, the seed must confirm that
+	// no other live process owns the id. A fresh node also may not reuse an
+	// existing (even currently offline) member id. Conflicts and an unreachable
+	// or incompatible seed fail startup instead of silently assigning a random
+	// replacement id. Requires NodeID. Default: false.
+	StrictNodeID bool
+
 	// SyncInterval is the anti-entropy pull period. Default: 10s.
 	SyncInterval time.Duration
 
@@ -326,6 +334,9 @@ func (c *Config) validate() error {
 	if len(c.ClusterSecret) < 16 {
 		return errors.New("pbreplication: ClusterSecret must be at least 16 characters")
 	}
+	if c.StrictNodeID && strings.TrimSpace(c.NodeID) == "" {
+		return errors.New("pbreplication: StrictNodeID requires NodeID")
+	}
 	if c.ResyncStrategy != "logical" && c.ResyncStrategy != "restart-copy" {
 		return fmt.Errorf("pbreplication: invalid ResyncStrategy %q (want \"logical\" or \"restart-copy\")", c.ResyncStrategy)
 	}
@@ -540,6 +551,18 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 	r.bindFirewallHooks(app)
 
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
+		// This runs before routes, listeners and background workers are started.
+		// A strict configured identity must never be silently replaced, and the
+		// seed must prove that another running process does not already own it.
+		if cfg.StrictNodeID {
+			if r.nodeID != cfg.NodeID {
+				return fmt.Errorf("pbreplication: configured node id %q does not match persisted node id %q", cfg.NodeID, r.nodeID)
+			}
+			if err := r.checkStrictNodeID(false); err != nil {
+				return err
+			}
+		}
+
 		// apis.Serve runs PocketBase's migration runner before triggering
 		// OnServe. Keep this milestone ahead of every replication-facing
 		// listener and worker so service logs expose the startup barrier.
