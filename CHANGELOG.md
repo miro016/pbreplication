@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/miro016/pbreplication/compare/v0.5.1...v0.6.0) (2026-09-09)
+
+
+### Features
+
+* run migrations before replication by default ([55f175b](https://github.com/miro016/pbreplication/commit/55f175b0d096dc8cbc3d12e38aef4bfd0c0cd9f8))
+* run migrations before replication by default ([d0584d0](https://github.com/miro016/pbreplication/commit/d0584d092bd91fbf346f687a3f4d0dbb7c9170e2))
+
 ## [0.5.1](https://github.com/miro016/pbreplication/compare/v0.5.0...v0.5.1) (2026-09-04)
 
 
