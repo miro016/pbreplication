@@ -197,3 +197,38 @@ func TestStrictNodeIDRequiresConfiguredID(t *testing.T) {
 		t.Fatalf("err = %v, want StrictNodeID validation failure", err)
 	}
 }
+
+func TestStrictNodeIDRejectsFreshCopyBeforeSnapshot(t *testing.T) {
+	identityChecks := 0
+	snapshotRequests := 0
+	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case identityCheckPath:
+			identityChecks++
+			http.Error(w, `{"message":"node id is already taken"}`, http.StatusConflict)
+		case "/api/replication/snapshot/db":
+			snapshotRequests++
+			http.Error(w, "must not be called", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer seed.Close()
+
+	app := newTestAppOnly(t)
+	r, err := Register(app, Config{
+		NodeID: "taken-node", StrictNodeID: true,
+		SeedURL: seed.URL, ClusterSecret: testSecret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := &dataDirApp{App: app, dir: t.TempDir()}
+	err = r.maybeFullCopyBootstrap(fresh)
+	if !errors.Is(err, errDuplicateNodeID) {
+		t.Fatalf("err = %v, want duplicate-node startup failure", err)
+	}
+	if identityChecks != 1 || snapshotRequests != 0 {
+		t.Fatalf("identity checks=%d snapshot requests=%d, want 1 and 0", identityChecks, snapshotRequests)
+	}
+}
