@@ -107,12 +107,18 @@ type Config struct {
 	// collection. Default: true.
 	ReplicateSuperusers *bool
 
-	// DeferMigrationsUntilSynced makes a fresh node that joins an
-	// existing cluster (SeedURL set, first start) postpone the host
-	// app's migrations until AFTER the initial full snapshot sync, and
-	// then run only those the cluster hasn't already applied. This
-	// avoids re-running migrations and seeds whose effects already
-	// exist in the cluster. Default: true.
+	// MigrateBeforeReplication keeps PocketBase's normal synchronous
+	// migration ordering: after an optional pre-open physical database
+	// copy, all pending host migrations run before replication workers or
+	// logical synchronization start. Default: true.
+	MigrateBeforeReplication *bool
+
+	// DeferMigrationsUntilSynced postpones host app migrations until after
+	// the initial logical sync and coordinates their history with peers.
+	//
+	// Deprecated: use MigrateBeforeReplication. The values are inverses;
+	// setting both to the same value is invalid. When only this legacy field
+	// is supplied it remains fully supported.
 	DeferMigrationsUntilSynced *bool
 
 	// DisableUIExtension turns off the "Replication" tab that is
@@ -197,8 +203,9 @@ type Config struct {
 	// row - orders of magnitude faster for large databases. The copy
 	// happens BEFORE PocketBase opens the database, so serve-time
 	// migrations run only the files the cluster hasn't applied and the
-	// node starts already in sync. Old seeds without snapshot support
-	// fall back to the logical sync automatically. Default: true.
+	// node starts already in sync. Under the default migration policy a
+	// failed fresh-node copy blocks startup; see MigrateBeforeReplication.
+	// Default: true.
 	FullCopyBootstrap *bool
 
 	// FullCopyChunkSize is the transfer chunk for database snapshot
@@ -206,8 +213,9 @@ type Config struct {
 	// unstable links resume instead of restarting. Default: 8MB.
 	FullCopyChunkSize int
 
-	// FullCopyFallbackAfter bounds how long a failing full copy is
-	// retried before the node falls back to the logical bootstrap.
+	// FullCopyFallbackAfter bounds how long a failing full copy is retried.
+	// With MigrateBeforeReplication enabled, a fresh follower then fails
+	// startup; the opt-in post-sync policy falls back to logical bootstrap.
 	// Default: 10m.
 	FullCopyFallbackAfter time.Duration
 
@@ -263,8 +271,15 @@ func (c *Config) setDefaults() {
 		v := true
 		c.ReplicateSuperusers = &v
 	}
-	if c.DeferMigrationsUntilSynced == nil {
+	if c.MigrateBeforeReplication == nil {
 		v := true
+		if c.DeferMigrationsUntilSynced != nil {
+			v = !*c.DeferMigrationsUntilSynced
+		}
+		c.MigrateBeforeReplication = &v
+	}
+	if c.DeferMigrationsUntilSynced == nil {
+		v := !*c.MigrateBeforeReplication
 		c.DeferMigrationsUntilSynced = &v
 	}
 	if c.FirewallExemptSuperusers == nil {
@@ -313,6 +328,14 @@ func (c *Config) validate() error {
 	}
 	if c.ResyncStrategy != "logical" && c.ResyncStrategy != "restart-copy" {
 		return fmt.Errorf("pbreplication: invalid ResyncStrategy %q (want \"logical\" or \"restart-copy\")", c.ResyncStrategy)
+	}
+	return nil
+}
+
+func (c *Config) validateMigrationPolicy() error {
+	if c.MigrateBeforeReplication != nil && c.DeferMigrationsUntilSynced != nil &&
+		*c.MigrateBeforeReplication == *c.DeferMigrationsUntilSynced {
+		return errors.New("pbreplication: MigrateBeforeReplication and DeferMigrationsUntilSynced are inverse options and conflict")
 	}
 	return nil
 }
@@ -373,7 +396,15 @@ type Replicator struct {
 	events *eventLog
 
 	// live bulk-sync progress (snapshot / full copy / integrity check)
-	progressState atomic.Pointer[SyncStatus]
+	progressState  atomic.Pointer[SyncStatus]
+	progressLogMu  sync.Mutex
+	progressLog    syncProgressLogState
+	progressSubsMu sync.Mutex
+	progressSubs   map[chan SyncStatus]struct{}
+	progressClosed bool
+	consoleIsTTY   bool
+	consoleMu      sync.Mutex
+	consoleLastLog time.Time
 
 	// last observed health per peer, for transition detection
 	healthMu   sync.Mutex
@@ -446,6 +477,9 @@ const maxPendingOps = 10000
 // Register wires the replication engine into the given PocketBase app.
 // Call it before app.Start().
 func Register(app core.App, cfg Config) (*Replicator, error) {
+	if err := cfg.validateMigrationPolicy(); err != nil {
+		return nil, err
+	}
 	cfg.setDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -466,17 +500,19 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 			// caller; the transport still bounds dial + header phases
 			Transport: newPeerTransport(),
 		},
-		runCtx:      runCtx,
-		runCancel:   runCancel,
-		pushWake:    make(chan struct{}, 1),
-		pullWake:    make(chan struct{}, 1),
-		applyCh:     make(chan *op, applyQueueCap(cfg.ApplyBatch)),
-		stopCh:      make(chan struct{}),
-		pushCursors: map[string]int64{},
-		excluded:    map[string]bool{},
-		events:      newEventLog(cfg.EventBufferSize),
-		prevHealth:  map[string]bool{},
-		opFailLast:  map[string]time.Time{},
+		runCtx:       runCtx,
+		runCancel:    runCancel,
+		pushWake:     make(chan struct{}, 1),
+		pullWake:     make(chan struct{}, 1),
+		applyCh:      make(chan *op, applyQueueCap(cfg.ApplyBatch)),
+		stopCh:       make(chan struct{}),
+		pushCursors:  map[string]int64{},
+		excluded:     map[string]bool{},
+		events:       newEventLog(cfg.EventBufferSize),
+		progressSubs: map[chan SyncStatus]struct{}{},
+		prevHealth:   map[string]bool{},
+		opFailLast:   map[string]time.Time{},
+		consoleIsTTY: stdoutIsTerminal(),
 	}
 	for _, name := range cfg.ExcludeCollections {
 		r.excluded[name] = true
@@ -504,6 +540,19 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 	r.bindFirewallHooks(app)
 
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
+		// apis.Serve runs PocketBase's migration runner before triggering
+		// OnServe. Keep this milestone ahead of every replication-facing
+		// listener and worker so service logs expose the startup barrier.
+		if *cfg.MigrateBeforeReplication {
+			r.logMilestone("migration phase complete; starting replication",
+				"policy", "before-replication",
+				"registered_app_migrations", len(core.AppMigrations.Items()),
+				"pending_app_migrations", 0)
+		} else {
+			r.logMilestone("pre-serve migration phase complete; starting replication with app migrations deferred",
+				"policy", "post-sync",
+				"deferred_app_migrations", len(r.deferredMigrations.Items()))
+		}
 		r.registerRoutes(se)
 		r.firewall.bindMiddleware(se)
 		if err := r.startReplicationListener(); err != nil {
@@ -655,6 +704,7 @@ func (r *Replicator) shutdown() {
 	})
 	r.stopReplicationListener()
 	r.wg.Wait()
+	r.closeSyncStatusSubscribers()
 	if r.nodeID != "" {
 		_ = setState(r.app.NonconcurrentDB(), stateHLC, r.clock.Current())
 	}
@@ -726,6 +776,22 @@ func (r *Replicator) console(format string, args ...any) {
 // without flooding the terminal. Call consoleProgressDone to terminate
 // the line once the operation completes.
 func (r *Replicator) consoleProgress(format string, args ...any) {
+	if !r.consoleIsTTY {
+		// Bulk copy/snapshot progress is emitted structurally from
+		// publishProgress. Keep this fallback for long incremental pulls,
+		// which don't publish SyncStatus updates.
+		if r.SyncStatus().Phase != SyncIdle {
+			return
+		}
+		r.consoleMu.Lock()
+		defer r.consoleMu.Unlock()
+		if !r.consoleLastLog.IsZero() && time.Since(r.consoleLastLog) < serviceProgressLogInterval {
+			return
+		}
+		r.consoleLastLog = time.Now()
+		r.console(format, args...)
+		return
+	}
 	fmt.Fprintf(os.Stdout, "\r%s [pbreplication] %s",
 		time.Now().Format("2006/01/02 15:04:05"), fmt.Sprintf(format, args...))
 }
@@ -733,8 +799,20 @@ func (r *Replicator) consoleProgress(format string, args ...any) {
 // consoleProgressDone finalizes an in-place progress line with a final
 // message and a trailing newline.
 func (r *Replicator) consoleProgressDone(format string, args ...any) {
+	if !r.consoleIsTTY {
+		r.consoleMu.Lock()
+		r.consoleLastLog = time.Time{}
+		r.consoleMu.Unlock()
+		r.console(format, args...)
+		return
+	}
 	fmt.Fprintf(os.Stdout, "\r\033[K%s [pbreplication] %s\n",
 		time.Now().Format("2006/01/02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+func stdoutIsTerminal() bool {
+	info, err := os.Stdout.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 // formatConsoleLine renders a message plus slog-style key/value args

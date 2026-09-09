@@ -47,19 +47,18 @@ after downtime) is discovered and handled automatically.
   the seed's entire SQLite database as one consistent snapshot
   (`VACUUM INTO`, chunked + resumable + checksummed) *before*
   PocketBase even opens it, then pulls only the deltas. Orders of
-  magnitude faster than row-by-row sync for large databases; falls back
-  to the logical sync against older peers automatically.
+  magnitude faster than row-by-row sync for large databases. With the default
+  migration policy, copy failure blocks a fresh follower before local
+  migrations can create conflicting seed data.
 - **Nodes can join late or rejoin** — anti-entropy replays missed
   operations; too-stale nodes resync with a logical snapshot (resumable
   across restarts) or, with `ResyncStrategy: "restart-copy"`, a full
   database copy that first **rescues local writes the cluster never
   saw** and replays them afterwards.
-- **Migrations are safe & cluster-coordinated** — schema changes
-  replicate as idempotent operations; the same migration running on
-  several nodes converges (content-hash dedup + LWW). On every start a
-  clustered node first asks its peers which migrations already ran and
-  executes only the rest — so a data-seeding migration can never run
-  twice and collide with rows arriving via sync.
+- **Migrations finish before replication by default** — a fresh follower first
+  installs the seed database copy, PocketBase then applies all pending
+  migrations synchronously, and only afterward do replication workers start.
+  Coordinated post-sync migrations remain available as an explicit opt-in.
 - **Cluster dashboard** — `/api/replication/dashboard` shows every
   node, its health, per-peer replication lag, live sync progress (with
   ETA and MB/s during a database copy), the relation-integrity status
@@ -143,7 +142,8 @@ docker compose up --build
 | `CompactionInterval` | `1h` | How often the oplog/bookkeeping garbage collection runs. |
 | `ExcludeCollections` | `_mfas, _otps, _authOrigins` | Collections that stay node-local. |
 | `ReplicateSuperusers` | `true` | Replicate the `_superusers` collection. |
-| `DeferMigrationsUntilSynced` | `true` | Clustered nodes postpone the app's migrations on every start and coordinate with peers, running only migrations no member has applied (see below). |
+| `MigrateBeforeReplication` | `true` | After an optional pre-open physical copy, let PocketBase apply all pending host migrations synchronously before replication workers or logical sync start. |
+| `DeferMigrationsUntilSynced` | unset | Deprecated inverse of `MigrateBeforeReplication`; setting it to `true` selects coordinated post-sync migrations. |
 | `RequestTimeout` | `30s` | Deadline for one node-to-node JSON request. Streaming transfers (files, database chunks) use per-chunk deadlines instead of one global timeout. |
 | `MaxBodyBytes` | `16MB` | Max node-to-node request body buffered for HMAC verification. |
 | `ApplyBatch` | `200` | Max remote ops applied per SQLite transaction on the receiving node. Batching amortises per-transaction cost when absorbing a peer's bulk writes; FIFO order and per-record LWW checks are unchanged. |
@@ -342,9 +342,11 @@ cluster doesn't crawl the seed row by row. The startup sequence is:
    backfilled in the background (`blob backfill`), and a
    relation-integrity check runs once everything settles.
 
-If the seed runs an older pbreplication without snapshot support (404),
-or the copy keeps failing for `FullCopyFallbackAfter`, the node falls
-back to the classic logical row-by-row bootstrap automatically.
+With the default migration-before-replication policy, a fresh follower fails
+startup if the seed does not support the copy endpoint or the copy cannot be
+completed; this prevents local seed migrations from colliding with records that
+would arrive in a later logical sync. Logical fallback remains available when
+`MigrateBeforeReplication` is explicitly set to `false`.
 
 ### Long-offline nodes (`ResyncStrategy`)
 
@@ -382,7 +384,9 @@ r.LeaderID()    // deterministic leader (lowest healthy id)
 r.IsLeader()    // gate singleton work (cron jobs, ...)
 
 r.Status()      // ClusterStatus: everything /status returns, typed
-r.SyncStatus()  // live bulk-sync phase/progress/ETA
+r.SyncStatus()  // live bulk-sync phase/progress/ETA snapshot
+updates, cancel := r.SubscribeSyncStatus(1) // immediate + coalesced live updates
+defer cancel()
 r.Counters()    // applied/failed/blocked, oplog size, backlogs
 r.PeerLags()    // per-peer: how many of our ops they haven't acked
 r.LastError()   // most recent replication error
@@ -433,9 +437,32 @@ r.LastIntegrityReport()        // result of the last scan
 
 ## Migrations & seeding on clustered nodes
 
-App migrations on a clustered node (a `SeedURL` is configured, or peers
-are already known) are **coordinated with the cluster on every start**,
-not just the first one:
+By default, `MigrateBeforeReplication` is `true`. Startup ordering is:
+
+1. A fresh follower optionally installs a physical copy before PocketBase opens
+   the database.
+2. PocketBase opens that database and synchronously applies every pending system
+   and host migration.
+3. Only after migration succeeds does `OnServe` start replication workers and
+   any logical synchronization.
+
+With this default, a fresh follower cannot silently fall back from a failed
+physical copy to a logical bootstrap: startup fails instead, preventing local
+seed migrations from creating rows that would collide with the seed's data.
+Fix connectivity or copy support and restart. Applications that explicitly
+disable `FullCopyBootstrap` accept responsibility for making their migrations
+idempotent.
+
+Existing databases apply newly shipped migrations locally before contacting
+peers. Therefore data-seeding migrations used with this default must be
+idempotent (for example, stable record IDs or existence guards), especially
+during simultaneous multi-node upgrades. Use the post-sync policy below when
+that constraint cannot be met.
+
+Set `MigrateBeforeReplication: false` only when an application deliberately
+wants coordinated post-sync migration behavior. In that mode, app migrations on
+a clustered node (a `SeedURL` is configured, or peers are already known) are
+coordinated with the cluster on every start:
 
 1. At startup the app's migrations are held back, so PocketBase's
    serve-time runner applies only its own system migrations.
@@ -466,8 +493,9 @@ Fallbacks and edge cases:
   before running, which narrows but cannot fully eliminate the race
   (there is no distributed lock). Write seeding migrations
   idempotently (fixed ids, or guard with an existence check).
-- Set `DeferMigrationsUntilSynced: false` to restore plain
-  migrate-at-startup behavior everywhere.
+- `DeferMigrationsUntilSynced: true` remains a deprecated, compatible way to
+  select this post-sync policy. Do not set both options unless their values are
+  logical inverses.
 
 ### Startup & migration logs
 
@@ -476,6 +504,7 @@ Key lifecycle milestones are written to **both** the PocketBase logger
 process stdout, so you can follow a joining node live in the console:
 
 ```
+2026/07/09 09:12:02 [pbreplication] migration phase complete; starting replication policy=before-replication registered_app_migrations=57 pending_app_migrations=0
 2026/07/09 09:12:03 [pbreplication] instance connected to cluster node=abc123 seed=http://node1:8090 members=2
 2026/07/09 09:12:03 [pbreplication] starting initial data migration (full snapshot sync from seed) node=abc123 seed=http://node1:8090
 2026/07/09 09:12:03 [pbreplication] estimating full sync duration rows_to_sync=1500000
@@ -486,10 +515,14 @@ process stdout, so you can follow a joining node live in the console:
 2026/07/09 09:14:04 [pbreplication] initial bootstrap complete node=abc123 seed=http://node1:8090
 ```
 
-Each collection shows a live, in-place progress counter while its rows
-are streaming in, then settles into a final per-collection total. The
-completion line reports how many collections and rows were migrated and
-how long the sync took.
+In an interactive terminal, each collection shows a live, in-place progress
+counter while its rows are streaming in, then settles into a final
+per-collection total. When stdout is redirected (for example by systemd or a
+Windows service wrapper), pbreplication instead writes newline-delimited
+`sync progress` records on phase changes, 10% boundaries, or at least every 15
+seconds. Those records include the current phase, peer/collection, bytes or
+rows, percentage, and ETA when known. The completion line reports how many
+collections and rows were migrated and how long the sync took.
 
 **Estimated completion time (ETA).** For large databases the seed
 reports its per-collection row counts, so a joining node knows the total
@@ -516,7 +549,12 @@ in-place progress counter while paging through the backlog, then settle
 into the final `pulled N ops from <peer>` line. These pull events are
 written to both stdout and the `_logs` table.
 
-Caveats:
+Applications can consume the same live state without polling by calling
+`SubscribeSyncStatus(buffer)`. The subscription immediately receives the
+current state and then coalesces updates when the consumer is slower than the
+replication loop; invoking the returned cancel function closes the channel.
+
+Caveats for the opt-in post-sync policy:
 
 - On a fresh joining node `./app migrate up` reports nothing to apply
   until the first successful sync — the deferral also holds for the

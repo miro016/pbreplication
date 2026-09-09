@@ -37,9 +37,10 @@ func TestCoordinateMigrationsUnion(t *testing.T) {
 	}
 
 	r := newTestNodeCfg(t, app, Config{
-		NodeID:        "nodeA0000000001", // lowest id -> leader, no jitter wait
-		SeedURL:       "http://seed.test:8090",
-		ClusterSecret: testSecret,
+		NodeID:                   "nodeA0000000001", // lowest id -> leader, no jitter wait
+		SeedURL:                  "http://seed.test:8090",
+		ClusterSecret:            testSecret,
+		MigrateBeforeReplication: testBool(false),
 	})
 	if !r.migrationsDeferred {
 		t.Fatal("precondition: migrations must be deferred")
@@ -90,6 +91,7 @@ func TestCoordinateMigrationsFallbackWhenUnreachable(t *testing.T) {
 		NodeID:                       "nodeA0000000001",
 		SeedURL:                      "http://seed.test:8090",
 		ClusterSecret:                testSecret,
+		MigrateBeforeReplication:     testBool(false),
 		MigrationCoordinationTimeout: 500 * time.Millisecond,
 	})
 

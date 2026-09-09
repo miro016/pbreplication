@@ -13,21 +13,18 @@ import (
 // PocketBase's migration bookkeeping table (see core.DefaultMigrationsTable).
 const migrationsTable = "_migrations"
 
-// maybeDeferAppMigrations moves the host app's registered migrations
-// out of the global core.AppMigrations on EVERY clustered start (a
-// seed is configured, or peers are already known), so that apis.Serve's
-// RunAllMigrations applies only system migrations. The deferred list is
-// run by the bootstrap goroutine after connecting to the cluster
-// (coordinateMigrations), skipping everything ANY reachable peer
-// already applied - this is what prevents a data-seeding migration
-// from running twice and colliding with rows arriving via sync (the
-// classic duplicate-seed hazard when a migration generates random
-// ids). Must run before apis.Serve, i.e. during app bootstrap.
+// maybeDeferAppMigrations implements the opt-in post-sync migration policy.
+// The default MigrateBeforeReplication policy leaves core.AppMigrations
+// untouched, so PocketBase runs them synchronously before OnServe starts any
+// replication workers. When explicitly disabled, this method moves the host
+// app's registered migrations out of the global list on every clustered start
+// and the bootstrap goroutine coordinates/runs them after synchronization.
+// Must run before apis.Serve, i.e. during app bootstrap.
 //
 // A standalone node (no seed, no known peers) never defers, so it can
 // never deadlock waiting for a cluster that doesn't exist.
 func (r *Replicator) maybeDeferAppMigrations(app core.App) error {
-	if !*r.cfg.DeferMigrationsUntilSynced || len(core.AppMigrations.Items()) == 0 {
+	if *r.cfg.MigrateBeforeReplication || len(core.AppMigrations.Items()) == 0 {
 		return nil
 	}
 
