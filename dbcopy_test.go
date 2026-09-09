@@ -426,6 +426,87 @@ func TestFullCopyFallsBackOnOldPeer(t *testing.T) {
 	}
 }
 
+func TestFreshCopyFailureHonorsMigrationPolicy(t *testing.T) {
+	// A peer without the database-copy endpoint fails immediately, avoiding the
+	// retry timeout while exercising the policy boundary.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.NotFound(w, req)
+	}))
+	defer srv.Close()
+
+	t.Run("default migrate-before policy fails closed", func(t *testing.T) {
+		base := newTestAppOnly(t)
+		app := &dataDirApp{App: base, dir: t.TempDir()}
+		r, err := Register(app, Config{
+			NodeID: "nodeX0000000001", ClusterSecret: testSecret, SeedURL: srv.URL,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.maybeFullCopyBootstrap(app); err == nil {
+			t.Fatal("fresh follower continued without the required pre-migration copy")
+		}
+	})
+
+	t.Run("explicit post-sync policy permits logical fallback", func(t *testing.T) {
+		base := newTestAppOnly(t)
+		app := &dataDirApp{App: base, dir: t.TempDir()}
+		r, err := Register(app, Config{
+			NodeID:                   "nodeX0000000002",
+			ClusterSecret:            testSecret,
+			SeedURL:                  srv.URL,
+			MigrateBeforeReplication: testBool(false),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.maybeFullCopyBootstrap(app); err != nil {
+			t.Fatalf("post-sync policy rejected logical fallback: %v", err)
+		}
+	})
+}
+
+func TestBootstrapInspectionFailureHonorsMigrationPolicy(t *testing.T) {
+	newCorruptApp := func(t *testing.T) *dataDirApp {
+		t.Helper()
+		base := newTestAppOnly(t)
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "data.db"), []byte("not a sqlite database"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return &dataDirApp{App: base, dir: dir}
+	}
+
+	t.Run("default migrate-before policy fails closed", func(t *testing.T) {
+		app := newCorruptApp(t)
+		r, err := Register(app, Config{
+			NodeID: "nodeX0000000003", ClusterSecret: testSecret, SeedURL: "http://seed.test",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.maybeFullCopyBootstrap(app); err == nil {
+			t.Fatal("uninspectable database was allowed to continue to migrations")
+		}
+	})
+
+	t.Run("explicit post-sync policy retains legacy fallback", func(t *testing.T) {
+		app := newCorruptApp(t)
+		r, err := Register(app, Config{
+			NodeID:                   "nodeX0000000004",
+			ClusterSecret:            testSecret,
+			SeedURL:                  "http://seed.test",
+			MigrateBeforeReplication: testBool(false),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.maybeFullCopyBootstrap(app); err != nil {
+			t.Fatalf("post-sync policy rejected legacy fallback: %v", err)
+		}
+	})
+}
+
 func TestFullCopyEndToEnd(t *testing.T) {
 	// seed with data
 	seedApp, seed := newTestNode(t, "seed000000000001")

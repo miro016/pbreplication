@@ -17,6 +17,10 @@ import (
 
 const testSecret = "test-secret-0123456789"
 
+func testBool(value bool) *bool {
+	return &value
+}
+
 // newTestNode creates a bootstrapped test app with the replicator
 // storage initialized (the OnBootstrap hook can't fire because the test
 // app is already bootstrapped, so initStorage is invoked directly).
@@ -705,7 +709,7 @@ func migrationApplied(t *testing.T, app core.App, file string) bool {
 	return n > 0
 }
 
-func TestDeferAppMigrationsDecision(t *testing.T) {
+func TestAppMigrationPolicyDecision(t *testing.T) {
 	noop := func(txApp core.App) error { return nil }
 
 	register2 := func() {
@@ -713,8 +717,8 @@ func TestDeferAppMigrationsDecision(t *testing.T) {
 		core.AppMigrations.Register(noop, nil, "m2.go")
 	}
 
-	// fresh node with a seed: migrations must be deferred
-	t.Run("fresh with seed", func(t *testing.T) {
+	// The default is synchronous migration before OnServe/replication.
+	t.Run("default fresh with seed migrates before replication", func(t *testing.T) {
 		stashAppMigrations(t)
 		app := newTestAppOnly(t)
 		register2()
@@ -723,12 +727,11 @@ func TestDeferAppMigrationsDecision(t *testing.T) {
 			SeedURL:       "http://seed.test:8090",
 			ClusterSecret: testSecret,
 		})
-		if len(core.AppMigrations.Items()) != 0 {
-			t.Fatal("global registry not emptied")
+		if len(core.AppMigrations.Items()) != 2 || r.migrationsDeferred {
+			t.Fatal("default policy must leave migrations for PocketBase's pre-serve runner")
 		}
-		if !r.migrationsDeferred || len(r.deferredMigrations.Items()) != 2 {
-			t.Fatalf("expected 2 deferred migrations, got %d (deferred=%v)",
-				len(r.deferredMigrations.Items()), r.migrationsDeferred)
+		if r.cfg.MigrateBeforeReplication == nil || !*r.cfg.MigrateBeforeReplication {
+			t.Fatal("MigrateBeforeReplication must default to true")
 		}
 	})
 
@@ -746,10 +749,8 @@ func TestDeferAppMigrationsDecision(t *testing.T) {
 		}
 	})
 
-	// already bootstrapped WITH a cluster: still deferred, so new
-	// migrations after an upgrade coordinate with peers instead of
-	// re-running (duplicate-seed hazard)
-	t.Run("already bootstrapped clustered", func(t *testing.T) {
+	// The default also applies to upgrades of existing clustered nodes.
+	t.Run("default already-bootstrapped cluster migrates before replication", func(t *testing.T) {
 		stashAppMigrations(t)
 		app := newTestAppOnly(t)
 		if err := createTables(app); err != nil {
@@ -764,13 +765,14 @@ func TestDeferAppMigrationsDecision(t *testing.T) {
 			SeedURL:       "http://seed.test:8090",
 			ClusterSecret: testSecret,
 		})
-		if len(core.AppMigrations.Items()) != 0 || !r.migrationsDeferred {
-			t.Fatal("clustered nodes must defer migrations on every start")
+		if len(core.AppMigrations.Items()) != 2 || r.migrationsDeferred {
+			t.Fatal("default policy must not defer migrations on clustered restarts")
 		}
 	})
 
-	// already bootstrapped, no seed, but known peers: also deferred
-	t.Run("bootstrapped seedless with peers", func(t *testing.T) {
+	// Disabling the before-replication policy retains coordinated post-sync
+	// migration behavior for applications that explicitly need it.
+	t.Run("post-sync policy with known peers", func(t *testing.T) {
 		stashAppMigrations(t)
 		app := newTestAppOnly(t)
 		if err := createTables(app); err != nil {
@@ -782,29 +784,73 @@ func TestDeferAppMigrationsDecision(t *testing.T) {
 			t.Fatal(err)
 		}
 		register2()
+		before := false
 		r := newTestNodeCfg(t, app, Config{
-			NodeID:        "nodeA0000000001",
-			ClusterSecret: testSecret,
+			NodeID:                   "nodeA0000000001",
+			ClusterSecret:            testSecret,
+			MigrateBeforeReplication: &before,
 		})
 		if len(core.AppMigrations.Items()) != 0 || !r.migrationsDeferred {
-			t.Fatal("a seed node with known peers must defer for coordination")
+			t.Fatal("explicit post-sync policy must defer migrations for coordination")
 		}
 	})
 
-	// deferral disabled: untouched
-	t.Run("opt-out", func(t *testing.T) {
+	// The deprecated inverse remains source-compatible when set by itself.
+	t.Run("legacy defer option", func(t *testing.T) {
 		stashAppMigrations(t)
 		app := newTestAppOnly(t)
 		register2()
-		off := false
+		deferMigrations := true
 		r := newTestNodeCfg(t, app, Config{
 			NodeID:                     "nodeA0000000001",
 			SeedURL:                    "http://seed.test:8090",
 			ClusterSecret:              testSecret,
-			DeferMigrationsUntilSynced: &off,
+			DeferMigrationsUntilSynced: &deferMigrations,
 		})
-		if len(core.AppMigrations.Items()) != 2 || r.migrationsDeferred {
-			t.Fatal("migrations must not be deferred when opted out")
+		if len(core.AppMigrations.Items()) != 0 || !r.migrationsDeferred || *r.cfg.MigrateBeforeReplication {
+			t.Fatal("legacy defer option must select the post-sync policy")
+		}
+	})
+
+	t.Run("legacy opt-out selects migrate-before policy", func(t *testing.T) {
+		stashAppMigrations(t)
+		app := newTestAppOnly(t)
+		register2()
+		r := newTestNodeCfg(t, app, Config{
+			NodeID:                     "nodeA0000000001",
+			SeedURL:                    "http://seed.test:8090",
+			ClusterSecret:              testSecret,
+			DeferMigrationsUntilSynced: testBool(false),
+		})
+		if len(core.AppMigrations.Items()) != 2 || r.migrationsDeferred || !*r.cfg.MigrateBeforeReplication {
+			t.Fatal("legacy deferral opt-out must select the migrate-before policy")
+		}
+	})
+
+	t.Run("explicit inverse options accepted", func(t *testing.T) {
+		app := newTestAppOnly(t)
+		if _, err := Register(app, Config{
+			NodeID:                     "nodeA0000000001",
+			ClusterSecret:              testSecret,
+			MigrateBeforeReplication:   testBool(true),
+			DeferMigrationsUntilSynced: testBool(false),
+		}); err != nil {
+			t.Fatalf("valid inverse migration options rejected: %v", err)
+		}
+	})
+
+	t.Run("conflicting options rejected", func(t *testing.T) {
+		app := newTestAppOnly(t)
+		before := true
+		deferMigrations := true
+		_, err := Register(app, Config{
+			NodeID:                     "nodeA0000000001",
+			ClusterSecret:              testSecret,
+			MigrateBeforeReplication:   &before,
+			DeferMigrationsUntilSynced: &deferMigrations,
+		})
+		if err == nil {
+			t.Fatal("conflicting migration policy options were accepted")
 		}
 	})
 }
@@ -855,9 +901,10 @@ func TestImportAndRunDeferredMigrations(t *testing.T) {
 	}, nil, "m2.go")
 
 	r := newTestNodeCfg(t, app, Config{
-		NodeID:        "nodeA0000000001",
-		SeedURL:       "http://seed.test:8090",
-		ClusterSecret: testSecret,
+		NodeID:                   "nodeA0000000001",
+		SeedURL:                  "http://seed.test:8090",
+		ClusterSecret:            testSecret,
+		MigrateBeforeReplication: testBool(false),
 	})
 	if !r.migrationsDeferred {
 		t.Fatal("expected deferred migrations")
@@ -906,9 +953,10 @@ func TestImportAndRunDeferredMigrations(t *testing.T) {
 			return nil
 		}, nil, "m3.go")
 		r2 := newTestNodeCfg(t, app2, Config{
-			NodeID:        "nodeB0000000001",
-			SeedURL:       "http://seed.test:8090",
-			ClusterSecret: testSecret,
+			NodeID:                   "nodeB0000000001",
+			SeedURL:                  "http://seed.test:8090",
+			ClusterSecret:            testSecret,
+			MigrateBeforeReplication: testBool(false),
 		})
 		if err := r2.importClusterMigrations(nil); err != nil {
 			t.Fatal(err)
@@ -1019,9 +1067,10 @@ func TestBootstrapDefersUntilSnapshot(t *testing.T) {
 	core.AppMigrations.Register(func(txApp core.App) error { m2Ran = true; return nil }, nil, "m2.go")
 
 	r := newTestNodeCfg(t, app, Config{
-		NodeID:        "nodeB0000000001",
-		SeedURL:       srv.URL,
-		ClusterSecret: testSecret,
+		NodeID:                   "nodeB0000000001",
+		SeedURL:                  srv.URL,
+		ClusterSecret:            testSecret,
+		MigrateBeforeReplication: testBool(false),
 	})
 
 	if err := r.bootstrapOrRejoin(); err != nil {
@@ -1058,9 +1107,10 @@ func TestBootstrapDefersUntilSnapshot(t *testing.T) {
 		core.AppMigrations.Register(func(txApp core.App) error { ran = true; return nil }, nil, "m1.go")
 
 		r2 := newTestNodeCfg(t, app2, Config{
-			NodeID:        "nodeC0000000001",
-			SeedURL:       oldSrv.URL,
-			ClusterSecret: testSecret,
+			NodeID:                   "nodeC0000000001",
+			SeedURL:                  oldSrv.URL,
+			ClusterSecret:            testSecret,
+			MigrateBeforeReplication: testBool(false),
 		})
 		if err := r2.bootstrapOrRejoin(); err != nil {
 			t.Fatal(err)

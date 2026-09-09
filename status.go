@@ -2,8 +2,19 @@ package pbreplication
 
 import (
 	"database/sql"
+	"fmt"
+	"strings"
+	"sync"
 	"time"
 )
+
+const serviceProgressLogInterval = 15 * time.Second
+
+type syncProgressLogState struct {
+	phase   SyncPhase
+	bucket  int
+	lastLog time.Time
+}
 
 // SyncPhase names what the replication engine is currently busy with.
 type SyncPhase string
@@ -76,11 +87,18 @@ func (r *Replicator) publishProgress(s SyncStatus) {
 		s.ETAString = s.ETA.Round(time.Second).String()
 	}
 	r.progressState.Store(&s)
+	r.notifySyncStatus(s)
+	r.logServiceSyncProgress(s, time.Now())
 }
 
 // clearProgress resets the live sync state to idle.
 func (r *Replicator) clearProgress() {
-	r.progressState.Store(&SyncStatus{Phase: SyncIdle})
+	idle := SyncStatus{Phase: SyncIdle}
+	r.progressState.Store(&idle)
+	r.notifySyncStatus(idle)
+	r.progressLogMu.Lock()
+	r.progressLog = syncProgressLogState{bucket: -1}
+	r.progressLogMu.Unlock()
 }
 
 // SyncStatus returns the live state of any bulk synchronization
@@ -90,6 +108,141 @@ func (r *Replicator) SyncStatus() SyncStatus {
 		return *v
 	}
 	return SyncStatus{Phase: SyncIdle}
+}
+
+// SubscribeSyncStatus returns a channel that receives an immediate snapshot
+// followed by live bulk-sync updates. Delivery is non-blocking and coalescing:
+// when a slow subscriber's buffer is full, the older buffered value is replaced
+// by the latest one. Call cancel when the subscription is no longer needed.
+// A buffer smaller than one is normalized to one.
+func (r *Replicator) SubscribeSyncStatus(buffer int) (<-chan SyncStatus, func()) {
+	if buffer < 1 {
+		buffer = 1
+	}
+	updates := make(chan SyncStatus, buffer)
+	r.progressSubsMu.Lock()
+	if r.progressClosed {
+		close(updates)
+		r.progressSubsMu.Unlock()
+		return updates, func() {}
+	}
+	if r.progressSubs == nil {
+		r.progressSubs = map[chan SyncStatus]struct{}{}
+	}
+	r.progressSubs[updates] = struct{}{}
+	updates <- r.SyncStatus()
+	r.progressSubsMu.Unlock()
+
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			r.progressSubsMu.Lock()
+			if _, ok := r.progressSubs[updates]; ok {
+				delete(r.progressSubs, updates)
+				close(updates)
+			}
+			r.progressSubsMu.Unlock()
+		})
+	}
+	return updates, cancel
+}
+
+func (r *Replicator) notifySyncStatus(status SyncStatus) {
+	r.progressSubsMu.Lock()
+	defer r.progressSubsMu.Unlock()
+	if r.progressClosed {
+		return
+	}
+	for updates := range r.progressSubs {
+		select {
+		case updates <- status:
+			continue
+		default:
+		}
+		// Retain the newest status for a slow subscriber.
+		select {
+		case <-updates:
+		default:
+		}
+		select {
+		case updates <- status:
+		default:
+		}
+	}
+}
+
+func (r *Replicator) closeSyncStatusSubscribers() {
+	r.progressSubsMu.Lock()
+	defer r.progressSubsMu.Unlock()
+	if r.progressClosed {
+		return
+	}
+	r.progressClosed = true
+	for updates := range r.progressSubs {
+		delete(r.progressSubs, updates)
+		close(updates)
+	}
+}
+
+func (r *Replicator) logServiceSyncProgress(status SyncStatus, now time.Time) {
+	if r.consoleIsTTY || status.Phase == SyncIdle {
+		return
+	}
+	bucket := syncStatusProgressBucket(status)
+	r.progressLogMu.Lock()
+	phaseChanged := r.progressLog.phase != status.Phase
+	progressChanged := bucket >= 0 && bucket != r.progressLog.bucket
+	heartbeatDue := r.progressLog.lastLog.IsZero() || now.Sub(r.progressLog.lastLog) >= serviceProgressLogInterval
+	shouldLog := phaseChanged || progressChanged || heartbeatDue
+	if shouldLog {
+		r.progressLog.lastLog = now
+	}
+	r.progressLog.phase = status.Phase
+	r.progressLog.bucket = bucket
+	r.progressLogMu.Unlock()
+	if shouldLog {
+		r.console("sync progress: %s", formatServiceSyncProgress(status))
+	}
+}
+
+func syncStatusProgressBucket(status SyncStatus) int {
+	if status.BytesTotal <= 0 && status.TotalRows <= 0 {
+		return -1
+	}
+	percent := status.Percent
+	if percent < 0 {
+		percent = 0
+	} else if percent > 100 {
+		percent = 100
+	}
+	return percent / 10
+}
+
+func formatServiceSyncProgress(status SyncStatus) string {
+	fields := []string{"phase=" + string(status.Phase)}
+	if status.Peer != "" {
+		fields = append(fields, "peer="+status.Peer)
+	}
+	if status.Collection != "" {
+		fields = append(fields, "collection="+status.Collection)
+	}
+	if status.BytesTotal > 0 {
+		fields = append(fields,
+			fmt.Sprintf("progress=%d%%", status.Percent),
+			fmt.Sprintf("bytes=%d/%d", status.BytesDone, status.BytesTotal),
+		)
+	} else if status.TotalRows > 0 {
+		fields = append(fields,
+			fmt.Sprintf("progress=%d%%", status.Percent),
+			fmt.Sprintf("rows=%d/%d", status.DoneRows, status.TotalRows),
+		)
+	} else if status.DoneRows > 0 {
+		fields = append(fields, fmt.Sprintf("rows=%d", status.DoneRows))
+	}
+	if status.ETAString != "" {
+		fields = append(fields, "eta="+status.ETAString)
+	}
+	return strings.Join(fields, " ")
 }
 
 // Counters returns the node's replication counters and backlog gauges.

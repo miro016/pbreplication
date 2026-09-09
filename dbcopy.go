@@ -62,8 +62,10 @@ func (r *Replicator) rescuePath() string {
 }
 
 // maybeFullCopyBootstrap runs BEFORE PocketBase opens its database
-// (pre e.Next() in OnBootstrap). Any failure falls back to the legacy
-// logical bootstrap instead of blocking startup.
+// (pre e.Next() in OnBootstrap). A fresh follower using the default
+// migrate-before-replication policy must copy successfully; otherwise local
+// seed migrations could create records that the later logical sync duplicates.
+// Other copy failures retain the legacy logical-bootstrap fallback.
 func (r *Replicator) maybeFullCopyBootstrap(app core.App) error {
 	if !*r.cfg.FullCopyBootstrap || r.cfg.SeedURL == "" {
 		return nil
@@ -71,6 +73,9 @@ func (r *Replicator) maybeFullCopyBootstrap(app core.App) error {
 
 	strategy, err := r.decideBootstrapStrategy(app)
 	if err != nil {
+		if *r.cfg.MigrateBeforeReplication {
+			return fmt.Errorf("inspect local database before migrations: %w", err)
+		}
 		r.logError("full copy: strategy decision failed - continuing with normal startup", err)
 		return nil
 	}
@@ -79,6 +84,10 @@ func (r *Replicator) maybeFullCopyBootstrap(app core.App) error {
 	}
 
 	if err := r.fullCopyBootstrap(app, strategy); err != nil {
+		if strategy == strategyFreshCopy && *r.cfg.MigrateBeforeReplication {
+			r.clearProgress()
+			return fmt.Errorf("fresh follower requires a full database copy before migrations: %w", err)
+		}
 		r.logError("full database copy failed - falling back to logical bootstrap", err)
 		r.emitEvent(EventCopyFinished, "full database copy failed; falling back to logical sync",
 			"peer", "", "error", err.Error())
