@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/miro016/pbreplication/compare/v0.7.0...v0.7.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* allow stopped nodes to rejoin with configured id ([8334017](https://github.com/miro016/pbreplication/commit/833401795af8cae60d0e1442977759691278cdce))
+* allow stopped nodes to rejoin with configured id ([87199f4](https://github.com/miro016/pbreplication/commit/87199f48208faacc873af595b99a84cb1e676582))
+
 ## [0.7.0](https://github.com/miro016/pbreplication/compare/v0.6.0...v0.7.0) (2026-09-11)
 
 
