@@ -75,12 +75,21 @@ func (r *Replicator) currentVector() (map[string]int64, error) {
 // gossip relay for them), queues them for application and advances the
 // contiguous vector.
 func (r *Replicator) ingestOps(ops []*op) error {
+	_, err := r.ingestOpsCount(ops)
+	return err
+}
+
+// ingestOpsCount is ingestOps with the number of newly accepted remote
+// operations. It excludes duplicates and operations echoed back to their
+// originating node.
+func (r *Replicator) ingestOpsCount(ops []*op) (int, error) {
 	if len(ops) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	db := r.app.NonconcurrentDB()
 	touched := map[string]bool{}
+	insertedCount := 0
 
 	for _, o := range ops {
 		if o.SrcNode == "" || o.SrcSeq <= 0 || o.SrcNode == r.nodeID {
@@ -88,10 +97,11 @@ func (r *Replicator) ingestOps(ops []*op) error {
 		}
 		inserted, err := insertOpIfAbsent(db, o)
 		if err != nil {
-			return err
+			return insertedCount, err
 		}
 		touched[o.SrcNode] = true
 		if inserted {
+			insertedCount++
 			r.enqueueApply(o)
 		}
 	}
@@ -100,11 +110,11 @@ func (r *Replicator) ingestOps(ops []*op) error {
 	for src := range touched {
 		cur, err := loadVectorEntry(db, src)
 		if err != nil {
-			return err
+			return insertedCount, err
 		}
 		next, err := advanceVector(db, src, cur)
 		if err != nil {
-			return err
+			return insertedCount, err
 		}
 		// a hole in the sequence means we missed earlier ops -> pull now
 		var maxSeq int64
@@ -118,7 +128,7 @@ func (r *Replicator) ingestOps(ops []*op) error {
 		wake(r.pullWake)
 	}
 	wake(r.pushWake) // relay to peers (gossip)
-	return nil
+	return insertedCount, nil
 }
 
 // loadVectorEntry reads a single persisted vector entry.
@@ -418,7 +428,13 @@ func (r *Replicator) pullFromPeer(m *member) error {
 			return err
 		}
 
-		_ = touchMember(r.app.NonconcurrentDB(), m.NodeID)
+		if err := touchMember(r.app.NonconcurrentDB(), m.NodeID); err != nil {
+			return fmt.Errorf("refresh peer %s after successful pull: %w", m.NodeID, err)
+		}
+		// syncRound passes this same member snapshot to health detection after
+		// the pull. Keep it in sync with the persisted timestamp so a long
+		// successful pull cannot be reported as an unhealthy peer.
+		m.LastSeen = nowStr()
 		r.mergeMembers(resp.Members)
 		r.notePeerVector(m.NodeID, resp.Vector)
 
@@ -430,7 +446,9 @@ func (r *Replicator) pullFromPeer(m *member) error {
 			return nil
 		}
 
-		if err := r.ingestOps(resp.Ops); err != nil {
+		inserted, err := r.ingestOpsCount(resp.Ops)
+		pulled += inserted
+		if err != nil {
 			if progressShown {
 				r.consoleProgressDone("pull from %s interrupted after %d ops", m.NodeID, pulled)
 			}
@@ -459,9 +477,7 @@ func (r *Replicator) pullFromPeer(m *member) error {
 			}
 			return fmt.Errorf("pull from %s returned %d ops without advancing the cursor", m.NodeID, len(resp.Ops))
 		}
-		pulled += len(resp.Ops)
-
-		if len(resp.Ops) >= r.cfg.MaxBatch {
+		if len(resp.Ops) >= r.cfg.MaxBatch && pulled > 0 {
 			// A full page commonly means more updates are waiting. An empty
 			// follow-up page is the authoritative completion signal; relying
 			// on a short page would be unsafe when peers use different limits.

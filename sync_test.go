@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pocketbase/dbx"
 )
@@ -157,5 +158,74 @@ func TestIngestOpsDoesNotEnqueueDuplicates(t *testing.T) {
 	}
 	if got := len(receiver.applyCh); got != 1 {
 		t.Fatalf("apply queue length = %d, want 1 for one unique operation", got)
+	}
+}
+
+func TestIngestOpsCountExcludesDuplicatesAndEchoedLocalOps(t *testing.T) {
+	_, receiver := newTestNode(t, "receiver00000001")
+	remote := &op{
+		SrcNode: "source0000000001", SrcSeq: 1, HLC: "0000000000000001-0000",
+		Type: opUpsert, ColID: "collection", ColName: "records", RecordID: "remote",
+		Payload: json.RawMessage(`{"value":true}`),
+	}
+	localEcho := &op{
+		SrcNode: receiver.nodeID, SrcSeq: 1, HLC: "0000000000000002-0000",
+		Type: opUpsert, ColID: "collection", ColName: "records", RecordID: "local",
+		Payload: json.RawMessage(`{"value":true}`),
+	}
+
+	if got, err := receiver.ingestOpsCount([]*op{remote, localEcho}); err != nil || got != 1 {
+		t.Fatalf("first ingest count = %d, %v; want 1", got, err)
+	}
+	if got, err := receiver.ingestOpsCount([]*op{remote, localEcho}); err != nil || got != 0 {
+		t.Fatalf("repeat ingest count = %d, %v; want 0", got, err)
+	}
+}
+
+func TestSuccessfulPullRefreshesMemberSnapshotUsedForHealth(t *testing.T) {
+	app, receiver := newTestNode(t, "receiver00000001")
+	peer := &member{
+		NodeID: "seed000000000001",
+		URL:    "",
+		// Deliberately stale enough to be unhealthy before the exchange.
+		LastSeen: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&pullResponse{
+			NodeID: peer.NodeID,
+			Vector: map[string]int64{},
+		})
+	}))
+	t.Cleanup(server.Close)
+	peer.URL = server.URL
+	if err := upsertMember(app.DB(), peer); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := receiver.pullFromPeer(peer); err != nil {
+		t.Fatal(err)
+	}
+	if !receiver.isHealthy(peer) {
+		t.Fatalf("successful pull retained stale last_seen %q", peer.LastSeen)
+	}
+}
+
+func TestSkipRequesterOwnedOpsPreventsEcho(t *testing.T) {
+	request := map[string]int64{
+		"requester000001": 10,
+		"other0000000001": 4,
+	}
+	peer := map[string]int64{
+		"requester000001": 25,
+		"other0000000001": 8,
+	}
+
+	got := skipRequesterOwnedOps(request, "requester000001", peer)
+	if got["requester000001"] != 25 {
+		t.Fatalf("requester vector = %d, want 25", got["requester000001"])
+	}
+	if got["other0000000001"] != 4 {
+		t.Fatalf("unrelated vector changed to %d", got["other0000000001"])
 	}
 }
