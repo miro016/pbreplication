@@ -193,6 +193,11 @@ func (r *Replicator) handlePull(e *core.RequestEvent) error {
 	if err != nil {
 		return e.InternalServerError("failed to compute vector", nil)
 	}
+	// The requester is authoritative for its own source sequence and already
+	// has every operation it created. A pull vector captured just before a
+	// concurrent local write can otherwise make a peer echo those operations
+	// back, wasting a page and producing misleading pull activity.
+	req.Vector = skipRequesterOwnedOps(req.Vector, req.Sender.NodeID, vector)
 
 	ops, snapshotRequired, err := opsAfterVector(r.app.DB(), req.Vector, req.Limit)
 	if err != nil {
@@ -207,6 +212,19 @@ func (r *Replicator) handlePull(e *core.RequestEvent) error {
 		Members:          members,
 		SnapshotRequired: snapshotRequired,
 	})
+}
+
+func skipRequesterOwnedOps(requestVector map[string]int64, requester string, peerVector map[string]int64) map[string]int64 {
+	if requestVector == nil {
+		requestVector = map[string]int64{}
+	}
+	if requester == "" {
+		return requestVector
+	}
+	if known := peerVector[requester]; known > requestVector[requester] {
+		requestVector[requester] = known
+	}
+	return requestVector
 }
 
 // noteSender keeps membership fresh from authenticated exchanges (this
