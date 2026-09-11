@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,37 @@ func TestAuthBufferedBodyStillReadable(t *testing.T) {
 	got, err := io.ReadAll(e.Request.Body)
 	if err != nil || string(got) != string(body) {
 		t.Fatalf("handler can't re-read body: %q err=%v", got, err)
+	}
+}
+
+func TestAuthDoesNotRefreshIdentityBeforeJoinAcceptsIt(t *testing.T) {
+	app, r := newTestNode(t, "seed-node")
+	const joiningNode = "joining-node"
+	lastSeen := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	if err := upsertMember(app.DB(), &member{NodeID: joiningNode, LastSeen: lastSeen}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{identityCheckPath, joinPath} {
+		body := []byte(`{"node_id":"joining-node","instance_id":"new-process"}`)
+		req := httptest.NewRequest(http.MethodPost, "http://peer"+path, strings.NewReader(string(body)))
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		mac := signPayload(r.cfg.ClusterSecret, joiningNode, ts, req.Method, req.URL.Path, body)
+		req.Header.Set("Authorization", fmt.Sprintf("%s %s.%s.%s", authScheme, joiningNode, ts, mac))
+		e := &core.RequestEvent{}
+		e.Response = httptest.NewRecorder()
+		e.Request = req
+
+		if err := r.requireClusterAuth(e); err != nil {
+			t.Fatalf("%s authentication failed: %v", path, err)
+		}
+		owner, err := getMember(app.DB(), joiningNode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if owner.LastSeen != lastSeen {
+			t.Fatalf("%s refreshed unverified identity: last_seen=%q want %q", path, owner.LastSeen, lastSeen)
+		}
 	}
 }
 

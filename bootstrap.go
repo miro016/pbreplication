@@ -69,6 +69,8 @@ type snapshotRecordsPage struct {
 	NextAfter string                `json:"next_after"`
 }
 
+const joinPath = "/api/replication/join"
+
 // ---------------------------------------------------------------------
 // startup decision
 
@@ -109,6 +111,12 @@ func (r *Replicator) bootstrapOrRejoin() error {
 	join, err := r.joinCluster()
 	if err != nil {
 		if errors.Is(err, errDuplicateNodeID) {
+			if r.cfg.StrictNodeID {
+				// Keep the configured identity and retry. The strict pre-start
+				// check is authoritative; a join conflict can still be transient
+				// when a member restarts during the health-TTL window.
+				return fmt.Errorf("strict node id %q was temporarily rejected during rejoin: %w", r.nodeID, err)
+			}
 			// Persistently flagged by joinCluster: the next start
 			// regenerates this node's identity BEFORE serving. Swapping
 			// the id while handlers and capture hooks are live isn't
@@ -172,11 +180,13 @@ func (r *Replicator) bootstrapOrRejoin() error {
 func (r *Replicator) joinCluster() (*joinResponse, error) {
 	req := &joinRequest{NodeID: r.nodeID, URL: r.cfg.NodeURL, InstanceID: r.instanceID}
 	var resp joinResponse
-	if err := r.callPeer(r.cfg.SeedURL, http.MethodPost, "/api/replication/join", req, &resp); err != nil {
+	if err := r.callPeer(r.cfg.SeedURL, http.MethodPost, joinPath, req, &resp); err != nil {
 		if httpStatus(err) == http.StatusConflict {
 			// a duplicate-aware seed refused the join because it runs
 			// under our id itself - this database is a clone of its
-			r.flagDuplicateNodeID(-1)
+			if !r.cfg.StrictNodeID {
+				r.flagDuplicateNodeID(-1)
+			}
 			return nil, fmt.Errorf("%w: %v", errDuplicateNodeID, err)
 		}
 		return nil, err
@@ -190,7 +200,9 @@ func (r *Replicator) joinCluster() (*joinResponse, error) {
 		if resp.Vector != nil {
 			ack = resp.Vector[r.nodeID]
 		}
-		r.flagDuplicateNodeID(ack)
+		if !r.cfg.StrictNodeID {
+			r.flagDuplicateNodeID(ack)
+		}
 		return nil, errDuplicateNodeID
 	}
 	r.mergeMembers(resp.Members)

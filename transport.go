@@ -77,7 +77,8 @@ func (r *Replicator) verifyAuth(req *http.Request, body []byte) (string, error) 
 
 // requireClusterAuth is a middleware for the node-to-node endpoints. It
 // verifies the HMAC (buffering the body so handlers can still read it)
-// and refreshes the caller's membership liveness. Body-less requests
+// and refreshes the caller's membership liveness after its identity has
+// already been established. Body-less requests
 // (all the GETs) skip the buffering entirely; bodies larger than
 // cfg.MaxBodyBytes are rejected instead of buffered.
 func (r *Replicator) requireClusterAuth(e *core.RequestEvent) error {
@@ -101,9 +102,12 @@ func (r *Replicator) requireClusterAuth(e *core.RequestEvent) error {
 	if err != nil {
 		return e.UnauthorizedError("cluster authentication failed", nil)
 	}
-	// An identity availability probe must not refresh an existing member with
-	// the caller's claimed id before ownership has been established.
-	if nodeID != r.nodeID && e.Request.URL.Path != identityCheckPath {
+	// Identity checks and joins must not refresh an existing member with the
+	// caller's claimed id before ownership has been established. In particular,
+	// touching last_seen here would make every join conflict with its own newly
+	// created activity when the callback still points at an old URL.
+	path := e.Request.URL.Path
+	if nodeID != r.nodeID && path != identityCheckPath && path != joinPath {
 		_ = touchMember(r.app.NonconcurrentDB(), nodeID)
 	}
 	e.Set(ctxCallerNodeID, nodeID)

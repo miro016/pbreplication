@@ -129,6 +129,29 @@ func TestHandleIdentityCheck(t *testing.T) {
 			t.Fatalf("immediate restart at the same URL rejected: code=%d err=%v", rec.Code, err)
 		}
 	})
+
+	t.Run("verified new address may replace recently active old address", func(t *testing.T) {
+		stopped := httptest.NewServer(http.NotFoundHandler())
+		stoppedURL := stopped.URL
+		stopped.Close()
+		joining := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			_ = json.NewEncoder(w).Encode(&identityPing{NodeID: "restarting-node", InstanceID: "new-process"})
+		}))
+		defer joining.Close()
+
+		app, r := newTestNode(t, "seed-node")
+		if err := upsertMember(app.DB(), &member{
+			NodeID: "restarting-node", URL: stoppedURL,
+			LastSeen: time.Now().UTC().Format(time.RFC3339),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rec, err := execHandler(t, r, r.handleIdentityCheck, http.MethodPost, identityCheckPath,
+			strictIdentityBodyWithURL(t, "restarting-node", "new-process", joining.URL, false))
+		if err != nil || rec.Code != http.StatusOK {
+			t.Fatalf("restart at verified new address rejected: code=%d err=%v", rec.Code, err)
+		}
+	})
 }
 
 func TestCheckStrictNodeID(t *testing.T) {
@@ -230,5 +253,59 @@ func TestStrictNodeIDRejectsFreshCopyBeforeSnapshot(t *testing.T) {
 	}
 	if identityChecks != 1 || snapshotRequests != 0 {
 		t.Fatalf("identity checks=%d snapshot requests=%d, want 1 and 0", identityChecks, snapshotRequests)
+	}
+}
+
+func TestStrictJoinConflictDoesNotScheduleIdentityRegeneration(t *testing.T) {
+	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Error(w, `{"message":"node id is already taken"}`, http.StatusConflict)
+	}))
+	defer seed.Close()
+
+	app := newTestAppOnly(t)
+	r := newTestNodeCfg(t, app, Config{
+		NodeID: "configured-node", StrictNodeID: true,
+		SeedURL: seed.URL, ClusterSecret: testSecret,
+	})
+	if _, err := r.joinCluster(); !errors.Is(err, errDuplicateNodeID) {
+		t.Fatalf("join error = %v, want duplicate node id", err)
+	}
+	if pending, err := getState(app.DB(), stateDupNodePending); err != nil || pending != "" {
+		t.Fatalf("strict join scheduled identity regeneration: pending=%q err=%v", pending, err)
+	}
+}
+
+func TestStrictJoinDuplicateResponseDoesNotScheduleIdentityRegeneration(t *testing.T) {
+	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_ = json.NewEncoder(w).Encode(&joinResponse{
+			NodeID: "configured-node", InstanceID: "different-process",
+			Vector: map[string]int64{"configured-node": 42},
+		})
+	}))
+	defer seed.Close()
+
+	app := newTestAppOnly(t)
+	r := newTestNodeCfg(t, app, Config{
+		NodeID: "configured-node", StrictNodeID: true,
+		SeedURL: seed.URL, ClusterSecret: testSecret,
+	})
+	if _, err := r.joinCluster(); !errors.Is(err, errDuplicateNodeID) {
+		t.Fatalf("join error = %v, want duplicate node id", err)
+	}
+	if pending, err := getState(app.DB(), stateDupNodePending); err != nil || pending != "" {
+		t.Fatalf("strict join response scheduled identity regeneration: pending=%q err=%v", pending, err)
+	}
+}
+
+func TestClearDuplicateNodeIDFlag(t *testing.T) {
+	app, r := newTestNode(t, "configured-node")
+	if err := setState(app.DB(), stateDupNodePending, "-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.clearDuplicateNodeIDFlag(); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := getState(app.DB(), stateDupNodePending); err != nil || pending != "" {
+		t.Fatalf("pending flag = %q, err=%v; want empty", pending, err)
 	}
 }
