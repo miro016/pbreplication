@@ -229,3 +229,28 @@ func TestSkipRequesterOwnedOpsPreventsEcho(t *testing.T) {
 		t.Fatalf("unrelated vector changed to %d", got["other0000000001"])
 	}
 }
+
+func TestRunAfterBootstrapGatesSynchronization(t *testing.T) {
+	r := &Replicator{stopCh: make(chan struct{})}
+	ready := make(chan struct{})
+	started := make(chan struct{})
+	r.wg.Add(1)
+	go r.runAfterBootstrap(ready, func() {
+		close(started)
+		r.wg.Done()
+	})
+
+	select {
+	case <-started:
+		t.Fatal("synchronization started before bootstrap completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(ready)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("synchronization did not start after bootstrap completed")
+	}
+	r.wg.Wait()
+}

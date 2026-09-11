@@ -561,6 +561,12 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 			if err := r.checkStrictNodeID(false); err != nil {
 				return err
 			}
+			// A successful authoritative check supersedes a join-time conflict
+			// recorded by an earlier process. In strict mode the configured id
+			// must never be silently replaced on the next restart.
+			if err := r.clearDuplicateNodeIDFlag(); err != nil {
+				return err
+			}
 		}
 
 		// apis.Serve runs PocketBase's migration runner before triggering
@@ -694,14 +700,20 @@ func (r *Replicator) startBackground() {
 		r.cursorMu.Unlock()
 	}
 
+	// Do not let this process send ordinary authenticated traffic before its
+	// join is accepted. Otherwise the seed can refresh the old member's
+	// last_seen from this very process and then reject the immediately following
+	// join as a duplicate id.
+	bootstrapReady := make(chan struct{})
 	r.wg.Add(5)
-	go r.pushLoop()
-	go r.antiEntropyLoop()
+	go r.runAfterBootstrap(bootstrapReady, r.pushLoop)
+	go r.runAfterBootstrap(bootstrapReady, r.antiEntropyLoop)
 	go r.applyLoop()
 	go r.compactLoop()
 	go r.geoLoop()
 
 	go func() {
+		defer close(bootstrapReady)
 		// Keep retrying until the initial bootstrap succeeds: a fresh
 		// node with deferred migrations has no app schema at all until
 		// the first snapshot lands.
@@ -718,6 +730,17 @@ func (r *Replicator) startBackground() {
 			}
 		}
 	}()
+}
+
+func (r *Replicator) runAfterBootstrap(ready <-chan struct{}, loop func()) {
+	select {
+	case <-ready:
+		loop()
+	case <-r.stopCh:
+		// The gated loop owns one wait-group slot but was never entered, so
+		// account for it here instead of relying on the loop's deferred Done.
+		r.wg.Done()
+	}
 }
 
 func (r *Replicator) shutdown() {

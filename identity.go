@@ -138,10 +138,7 @@ func (r *Replicator) handleIdentityCheck(e *core.RequestEvent) error {
 // traffic remains conservative evidence that the old owner is still alive.
 func (r *Replicator) registeredIdentityInUse(owner *member, joiningInstanceID, joiningURL string) (bool, string) {
 	if owner.URL != "" {
-		ctx, cancel := context.WithTimeout(r.runCtx, min(r.cfg.RequestTimeout, 5*time.Second))
-		defer cancel()
-		ping := &identityPing{}
-		err := r.callPeerCtx(ctx, owner.URL, http.MethodGet, "/api/replication/ping", nil, ping)
+		ping, err := r.identityPing(owner.URL)
 		if err == nil && ping.NodeID == owner.NodeID {
 			if ping.InstanceID == "" || ping.InstanceID != joiningInstanceID {
 				return true, "active member"
@@ -153,6 +150,20 @@ func (r *Replicator) registeredIdentityInUse(owner *member, joiningInstanceID, j
 		if strings.TrimRight(joiningURL, "/") == strings.TrimRight(owner.URL, "/") {
 			return false, ""
 		}
+
+		// A restart may advertise a new address while the member table still
+		// contains its old one. If the new address answers with the joining
+		// process's instance id, it proves this is that restart rather than a
+		// second process claiming a recently active member's id.
+		if joiningURL != "" {
+			joiningPing, joiningErr := r.identityPing(joiningURL)
+			if joiningErr == nil && joiningPing.NodeID == owner.NodeID && joiningPing.InstanceID != "" {
+				if joiningPing.InstanceID == joiningInstanceID {
+					return false, ""
+				}
+				return true, "active member at joining URL"
+			}
+		}
 	}
 	if r.isHealthy(owner) {
 		kind := "recently active member"
@@ -162,6 +173,14 @@ func (r *Replicator) registeredIdentityInUse(owner *member, joiningInstanceID, j
 		return true, kind
 	}
 	return false, ""
+}
+
+func (r *Replicator) identityPing(url string) (*identityPing, error) {
+	ctx, cancel := context.WithTimeout(r.runCtx, min(r.cfg.RequestTimeout, 5*time.Second))
+	defer cancel()
+	ping := &identityPing{}
+	err := r.callPeerCtx(ctx, url, http.MethodGet, "/api/replication/ping", nil, ping)
+	return ping, err
 }
 
 func (r *Replicator) identityConflict(e *core.RequestEvent, nodeID, owner string) error {
@@ -187,6 +206,17 @@ func (r *Replicator) flagDuplicateNodeID(seedAck int64) {
 		"under the new id)", "node", r.nodeID)
 	r.emitEvent(EventDuplicateNode, "duplicate node id detected - restart this node to regenerate its identity",
 		"node", r.nodeID)
+}
+
+func (r *Replicator) clearDuplicateNodeIDFlag() error {
+	value, err := getState(r.app.DB(), stateDupNodePending)
+	if err != nil || value == "" {
+		return err
+	}
+	if err := setState(r.app.NonconcurrentDB(), stateDupNodePending, ""); err != nil {
+		return fmt.Errorf("clear stale duplicate-node-id flag: %w", err)
+	}
+	return nil
 }
 
 // resolveDuplicateNodeID runs BEFORE the node starts serving (and
