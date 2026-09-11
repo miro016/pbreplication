@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/miro016/pbreplication/compare/v0.6.0...v0.7.0) (2026-09-11)
+
+
+### Features
+
+* reject duplicate configured node IDs ([b435247](https://github.com/miro016/pbreplication/commit/b435247903de05a1535b03024b8f8744729ba181))
+
+
+### Bug Fixes
+
+* Added strict mode for node ID - if multiple nodes are detected with the same id, the app fails to start + other minor fixes ([7db227a](https://github.com/miro016/pbreplication/commit/7db227ac2ae9475843f6d8d5e90eae3773dec052))
+* prevent replication echo and false peer health changes ([f1442da](https://github.com/miro016/pbreplication/commit/f1442da66e98d87f13298a17ab079af826fe1d2b))
+
 ## [0.6.0](https://github.com/miro016/pbreplication/compare/v0.5.1...v0.6.0) (2026-09-09)
 
 
