@@ -126,7 +126,12 @@ func (r *Replicator) bootstrapOrRejoin() error {
 		if done == "" {
 			return fmt.Errorf("initial join via seed %s failed: %w", r.cfg.SeedURL, err)
 		}
-		r.logError("re-join announce failed (anti-entropy continues)", err)
+		// A rejoining node keeps its persisted member list, so a temporarily
+		// unreachable seed self-heals through the regular push/pull
+		// exchanges once it starts. Report it at info level: an error here
+		// would never be retracted (the recovery path has no hook for it)
+		// and stays on the dashboard forever.
+		r.logInfo("re-join announce failed (anti-entropy continues)", "error", err.Error())
 		// deferred migrations must still run - coordinateMigrations has
 		// its own peer-unreachable fallback
 		r.coordinateMigrations()

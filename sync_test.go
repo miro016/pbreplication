@@ -20,6 +20,10 @@ import (
 func TestClearPeerErrRetractsGlobalLastError(t *testing.T) {
 	_, r := newTestNode(t, "nodeM0000000001")
 
+	// The peer answered at least once in this process, so its later
+	// failure is a genuine outage reported at error level.
+	r.clearPeerErr("nodeA0000000001")
+
 	r.notePeerErr("nodeA0000000001", errors.New("dial tcp: connection refused"))
 
 	if v, _ := r.memberErrs.Load("nodeA0000000001"); v != "dial tcp: connection refused" {
@@ -46,6 +50,7 @@ func TestClearPeerErrKeepsUnrelatedLastError(t *testing.T) {
 
 	// An unrelated error recorded after the peer failure must survive
 	// the peer's recovery.
+	r.clearPeerErr("nodeA0000000001")
 	r.notePeerErr("nodeA0000000001", errors.New("connection refused"))
 	r.logError("compaction failed", errors.New("disk full"))
 
@@ -59,6 +64,8 @@ func TestClearPeerErrKeepsUnrelatedLastError(t *testing.T) {
 func TestClearPeerErrKeepsOtherPeersLastError(t *testing.T) {
 	_, r := newTestNode(t, "nodeM0000000001")
 
+	r.clearPeerErr("nodeA0000000001")
+	r.clearPeerErr("nodeB0000000001")
 	r.notePeerErr("nodeA0000000001", errors.New("connection refused"))
 	r.notePeerErr("nodeB0000000001", errors.New("connection refused"))
 
@@ -68,6 +75,31 @@ func TestClearPeerErrKeepsOtherPeersLastError(t *testing.T) {
 
 	if le := r.LastError(); !strings.Contains(le, "nodeB0000000001") {
 		t.Fatalf("other peer's last error was lost: %q", le)
+	}
+}
+
+// A peer that never answered in this process (start-order race, peer
+// still booting) must not be reported as an error; the same failure
+// after a successful exchange must be.
+func TestNotePeerErrDowngradesNeverHealthyPeerToInfo(t *testing.T) {
+	_, r := newTestNode(t, "nodeM0000000001")
+
+	// First failure of a never-seen peer: informational only.
+	r.notePeerErr("nodeA0000000001", errors.New("connection refused"))
+	if le := r.LastError(); le != "" {
+		t.Fatalf("never-healthy peer failure must not set the global error, got %q", le)
+	}
+	if v, _ := r.memberErrs.Load("nodeA0000000001"); v != "connection refused" {
+		t.Fatalf("member error not recorded: %v", v)
+	}
+	// Subsequent failures stay silent (not even info spam).
+	r.notePeerErr("nodeA0000000001", errors.New("still refused"))
+
+	// After a successful exchange the failure is a genuine outage.
+	r.clearPeerErr("nodeA0000000001")
+	r.notePeerErr("nodeA0000000001", errors.New("connection refused"))
+	if le := r.LastError(); !strings.Contains(le, "sync with peer nodeA0000000001 failing") {
+		t.Fatalf("post-recovery outage not reported as error: %q", le)
 	}
 }
 

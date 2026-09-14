@@ -116,6 +116,38 @@ func TestHealthTransitionEmitsEvent(t *testing.T) {
 	}
 }
 
+// A peer observed down FIRST stays "unknown": recording the initial
+// down state would emit a spurious "peer is healthy again" milestone on
+// the first successful pull of an ordinary start-order race.
+func TestHealthUnknownPeerUntilFirstSuccess(t *testing.T) {
+	_, r := newTestNode(t, "nodeA0000000001")
+
+	fresh := time.Now().UTC().Format(time.RFC3339)
+	stale := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+
+	peer := &member{NodeID: "nodeB0000000001", URL: "http://b.test", LastSeen: stale}
+	// first observation while down: no state recorded, no event
+	r.detectHealthTransitions([]*member{peer})
+	if _, known := r.prevHealth["nodeB0000000001"]; known {
+		t.Fatal("initial down state must not be recorded")
+	}
+
+	// peer comes up: still no milestone (it was never known unhealthy)
+	peer.LastSeen = fresh
+	r.detectHealthTransitions([]*member{peer})
+	if n := len(r.Events(0)); n != 0 {
+		t.Fatalf("spurious milestone for previously unknown peer: %+v", r.Events(0))
+	}
+
+	// a later genuine outage IS reported
+	peer.LastSeen = stale
+	r.detectHealthTransitions([]*member{peer})
+	evs := r.Events(1)
+	if len(evs) != 1 || evs[0].Type != EventPeerUnhealthy {
+		t.Fatalf("expected unhealthy event, got %+v", evs)
+	}
+}
+
 func TestPeerLagFromVectors(t *testing.T) {
 	app, r := newTestNode(t, "nodeA0000000001")
 

@@ -329,8 +329,19 @@ func (r *Replicator) detectHealthTransitions(members []*member) {
 		seen[m.NodeID] = true
 		cur := r.isHealthy(m)
 		prev, known := r.prevHealth[m.NodeID]
+		if !known {
+			// A peer not yet observed healthy stays "unknown" instead of
+			// recording an initial down state: that down state would emit
+			// a spurious "peer is healthy again" milestone (and flip-flop
+			// during start-order races) on the peer's first successful
+			// pull. Health tracking starts with the first success.
+			if cur {
+				r.prevHealth[m.NodeID] = cur
+			}
+			continue
+		}
 		r.prevHealth[m.NodeID] = cur
-		if !known || cur == prev {
+		if cur == prev {
 			continue
 		}
 		if cur {
@@ -584,14 +595,27 @@ func peerErrPrefix(nodeID string) string {
 // notePeerErr records (and logs, on first occurrence) a failed exchange
 // with a peer, so connectivity problems are visible on the dashboard
 // instead of silently stalling replication.
+//
+// A peer that never answered in this process (it is still booting, or
+// the nodes were started in the opposite order) is reported at info
+// level: an error there would flag an ordinary rolling restart as a
+// cluster failure. Once a peer HAS answered, any later failure is a
+// genuine outage and is logged as an error.
 func (r *Replicator) notePeerErr(nodeID string, err error) {
 	if prev, _ := r.memberErrs.Load(nodeID); prev == nil || prev.(string) == "" {
-		r.logError(peerErrPrefix(nodeID), err)
+		if _, healthy := r.seenHealthy.Load(nodeID); healthy {
+			r.logError(peerErrPrefix(nodeID), err)
+		} else {
+			r.logInfo("peer not reachable yet (will keep retrying)", "peer", nodeID, "error", err.Error())
+		}
 	}
 	r.memberErrs.Store(nodeID, err.Error())
 }
 
 func (r *Replicator) clearPeerErr(nodeID string) {
+	// A successful exchange proves the peer is up: from now on its
+	// failures deserve the error level (see notePeerErr).
+	r.seenHealthy.Store(nodeID, struct{}{})
 	r.memberErrs.Store(nodeID, "")
 	// If the global last-error still shows this peer's sync failure,
 	// retract it: the condition healed, and keeping it around makes the

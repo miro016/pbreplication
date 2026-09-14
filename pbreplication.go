@@ -403,6 +403,11 @@ type Replicator struct {
 	// last sync error per peer (empty entry = healthy), for the dashboard
 	memberErrs sync.Map // nodeID -> string
 
+	// peers that answered at least one authenticated exchange in THIS
+	// process; their later failures are genuine outages worth an error,
+	// unlike a peer that simply has not started (yet)
+	seenHealthy sync.Map // nodeID -> struct{}
+
 	// replication event timeline (ring buffer + subscribers)
 	events *eventLog
 
@@ -590,8 +595,18 @@ func Register(app core.App, cfg Config) (*Replicator, error) {
 		if !cfg.DisableUIExtension {
 			r.registerUIExtension(se)
 		}
+		if err := se.Next(); err != nil {
+			return err
+		}
+		// The remaining OnServe handlers - including PocketBase's default
+		// one that binds the TCP listener - have now completed, so this
+		// process can already accept the join-time reachability callback
+		// from the seed. Announcing only after the bind prevents the
+		// callback from racing a listener that cannot answer yet (which
+		// logged a bogus "pull-only mode" warning on nearly every start),
+		// and a node whose port could not be bound never joins at all.
 		r.startBackground()
-		return se.Next()
+		return nil
 	})
 
 	app.OnTerminate().BindFunc(func(e *core.TerminateEvent) error {
