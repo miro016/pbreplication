@@ -25,9 +25,8 @@ func isMarked(ctx context.Context) bool {
 const hookPriority = 999
 
 // bindCaptureHooks registers the hooks that record local changes into
-// the oplog. The *Execute hooks run inside the same transaction as the
-// data write, so oplog entries commit (or roll back) atomically with
-// the change itself.
+// the oplog. Record capture starts or reuses a write transaction;
+// collection capture runs inside PocketBase's schema transaction.
 func (r *Replicator) bindCaptureHooks(app core.App) {
 	app.OnRecordCreateExecute().Bind(&hook.Handler[*core.RecordEvent]{
 		Id: "pbreplicationCaptureCreate", Priority: hookPriority, Func: r.captureRecord(opUpsert),
@@ -54,61 +53,81 @@ func (r *Replicator) bindCaptureHooks(app core.App) {
 	app.OnRecordAfterDeleteSuccess().BindFunc(wakeFn)
 
 	// collection (schema) changes
-	app.OnCollectionAfterCreateSuccess().BindFunc(r.captureCollection(opColUpsert))
-	app.OnCollectionAfterUpdateSuccess().BindFunc(r.captureCollection(opColUpsert))
-	app.OnCollectionAfterDeleteSuccess().BindFunc(r.captureCollection(opColDelete))
+	app.OnCollectionCreateExecute().Bind(&hook.Handler[*core.CollectionEvent]{
+		Id: "pbreplicationCaptureCollectionCreate", Priority: hookPriority, Func: r.captureCollection(opColUpsert),
+	})
+	app.OnCollectionUpdateExecute().Bind(&hook.Handler[*core.CollectionEvent]{
+		Id: "pbreplicationCaptureCollectionUpdate", Priority: hookPriority, Func: r.captureCollection(opColUpsert),
+	})
+	app.OnCollectionDeleteExecute().Bind(&hook.Handler[*core.CollectionEvent]{
+		Id: "pbreplicationCaptureCollectionDelete", Priority: hookPriority, Func: r.captureCollection(opColDelete),
+	})
+	wakeCollectionFn := func(e *core.CollectionEvent) error {
+		if err := e.Next(); err != nil {
+			return err
+		}
+		if r.ready.Load() && !isMarked(e.Context) {
+			wake(r.pushWake)
+		}
+		return nil
+	}
+	app.OnCollectionAfterCreateSuccess().BindFunc(wakeCollectionFn)
+	app.OnCollectionAfterUpdateSuccess().BindFunc(wakeCollectionFn)
+	app.OnCollectionAfterDeleteSuccess().BindFunc(wakeCollectionFn)
 }
 
 // captureRecord returns an *Execute hook func that appends an oplog row
 // for a local record change, inside the write transaction.
 func (r *Replicator) captureRecord(opType string) func(e *core.RecordEvent) error {
 	return func(e *core.RecordEvent) error {
-		if err := e.Next(); err != nil {
-			return err
-		}
-		if !r.ready.Load() || isMarked(e.Context) {
-			return nil
-		}
-		col := e.Record.Collection()
-		if !r.isReplicated(col) {
-			return nil
+		if !r.ready.Load() || isMarked(e.Context) || !r.isReplicated(e.Record.Collection()) {
+			return e.Next()
 		}
 
-		db := e.App.NonconcurrentDB() // tx-bound when inside a transaction
+		originalApp := e.App
+		defer func() { e.App = originalApp }()
+		return originalApp.RunInTransaction(func(txApp core.App) error {
+			e.App = txApp
+			if err := e.Next(); err != nil {
+				return err
+			}
+			col := e.Record.Collection()
+			db := txApp.NonconcurrentDB()
 
-		seq, err := incrLocalSeq(db)
-		if err != nil {
-			return err
-		}
-
-		o := &op{
-			SrcNode:  r.nodeID,
-			SrcSeq:   seq,
-			HLC:      r.clock.Now(),
-			Type:     opType,
-			ColID:    col.Id,
-			ColName:  col.Name,
-			RecordID: e.Record.Id,
-		}
-
-		if opType == opUpsert {
-			payload, files, err := exportRecord(e.App, e.Record)
+			seq, err := incrLocalSeq(db)
 			if err != nil {
 				return err
 			}
-			o.Payload = payload
-			o.Files = files
-		}
 
-		if err := insertOp(db, o); err != nil {
-			return err
-		}
-		return upsertVersion(db, o.ColID, o.RecordID, o.HLC, o.SrcNode, opType == opDelete)
+			o := &op{
+				SrcNode:  r.nodeID,
+				SrcSeq:   seq,
+				HLC:      r.clock.Now(),
+				Type:     opType,
+				ColID:    col.Id,
+				ColName:  col.Name,
+				RecordID: e.Record.Id,
+			}
+
+			if opType == opUpsert {
+				payload, files, err := exportRecord(txApp, e.Record)
+				if err != nil {
+					return err
+				}
+				o.Payload = payload
+				o.Files = files
+			}
+
+			if err := insertOp(db, o); err != nil {
+				return err
+			}
+			return upsertVersion(db, o.ColID, o.RecordID, o.HLC, o.SrcNode, opType == opDelete)
+		})
 	}
 }
 
-// captureCollection returns an After*Success hook func that appends an
-// oplog row for a local schema change.
+// captureCollection runs after PocketBase's priority-99 Execute hook has
+// opened the transaction covering collection metadata and schema DDL.
 func (r *Replicator) captureCollection(opType string) func(e *core.CollectionEvent) error {
 	return func(e *core.CollectionEvent) error {
 		if err := e.Next(); err != nil {
@@ -122,8 +141,7 @@ func (r *Replicator) captureCollection(opType string) func(e *core.CollectionEve
 
 		seq, err := incrLocalSeq(db)
 		if err != nil {
-			r.logError("collection capture: seq", err)
-			return nil
+			return err
 		}
 
 		o := &op{
@@ -138,20 +156,14 @@ func (r *Replicator) captureCollection(opType string) func(e *core.CollectionEve
 		if opType == opColUpsert {
 			raw, err := exportCollectionJSON(e.Collection)
 			if err != nil {
-				r.logError("collection capture: marshal", err)
-				return nil
+				return err
 			}
 			o.Payload = raw
 		}
 
 		if err := insertOp(db, o); err != nil {
-			r.logError("collection capture: insert", err)
-			return nil
+			return err
 		}
-		if err := upsertVersion(db, collectionsColID, e.Collection.Id, o.HLC, o.SrcNode, opType == opColDelete); err != nil {
-			r.logError("collection capture: version", err)
-		}
-		wake(r.pushWake)
-		return nil
+		return upsertVersion(db, collectionsColID, e.Collection.Id, o.HLC, o.SrcNode, opType == opColDelete)
 	}
 }

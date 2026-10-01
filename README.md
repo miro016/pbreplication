@@ -89,6 +89,17 @@ after downtime) is discovered and handled automatically.
 ## How it works?
 The core idea: every node keeps a normal PocketBase SQLite database, plus a small operation log. Whenever a record is created, updated, or deleted, that change is written to the log in the same SQLite transaction — so the log and the data can never disagree.
 
+Capture starts a transaction for ordinary record saves and reuses an existing
+caller transaction when present. Schema capture runs inside PocketBase's schema
+transaction. The database change, local sequence, operation log, and version
+metadata commit or roll back together; capture failures are returned from
+`Save`/`Delete`. Sequence allocation is atomic under concurrent writes, and an
+unexpected local sequence collision fails the write rather than dropping it.
+Remote retries remain idempotent, and push notifications wait for commit.
+No application-level transaction wrapper is required. Hooks that run inside
+these transactions must use the event's `e.App` for database work, not a
+captured outer app.
+
 How changes spread: nodes talk to each other over plain HTTP/JSON on PocketBase's own port (or the dedicated replication port), authenticated with an HMAC built from the shared cluster secret. Two mechanisms work together:
 
 Push — after a write, a node sends the new log entries to its peers (batched and debounced, so bursts of writes become few requests).
@@ -654,7 +665,10 @@ traffic bypasses the CDN entirely.
 go test ./...
 ```
 
-The suite covers the HLC, LWW gating, capture→apply round-trips
+The suite covers concurrent sequence allocation, 120 concurrent writes across
+three nodes (create/update/delete convergence), capture-failure rollback for
+records and schema DDL, caller transaction rollback, local sequence collisions,
+the HLC, LWW gating, capture→apply round-trips
 (including autodate preservation and hook firing), schema-op
 idempotence, HMAC auth (incl. body-size caps), transport retries and
 resumable streams, the event ring buffer and health transitions, peer

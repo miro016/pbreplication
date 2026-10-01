@@ -230,19 +230,13 @@ func setState(db dbx.Builder, key, value string) error {
 // incrLocalSeq atomically increments and returns the local op sequence.
 // Must be called with the same builder (transaction) as the data write.
 func incrLocalSeq(db dbx.Builder) (int64, error) {
-	_, err := db.NewQuery(`INSERT INTO _repl_state (key, value) VALUES ({:key}, '1')
-		ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`).
-		Bind(dbx.Params{"key": stateLocalSeq}).Execute()
-	if err != nil {
-		return 0, err
-	}
-	v, err := getState(db, stateLocalSeq)
-	if err != nil {
-		return 0, err
-	}
 	var seq int64
-	if _, err := fmt.Sscanf(v, "%d", &seq); err != nil {
-		return 0, fmt.Errorf("invalid local_seq %q: %w", v, err)
+	err := db.NewQuery(`INSERT INTO _repl_state (key, value) VALUES ({:key}, '1')
+		ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+		RETURNING value`).
+		Bind(dbx.Params{"key": stateLocalSeq}).Row(&seq)
+	if err != nil {
+		return 0, err
 	}
 	return seq, nil
 }
@@ -251,8 +245,14 @@ func incrLocalSeq(db dbx.Builder) (int64, error) {
 // oplog
 
 func insertOp(db dbx.Builder, o *op) error {
-	_, err := insertOpIfAbsent(db, o)
-	return err
+	inserted, err := insertOpIfAbsent(db, o)
+	if err != nil {
+		return err
+	}
+	if !inserted {
+		return fmt.Errorf("replication operation sequence collision: %s/%d", o.SrcNode, o.SrcSeq)
+	}
+	return nil
 }
 
 // insertOpIfAbsent stores o and reports whether it was newly inserted.
