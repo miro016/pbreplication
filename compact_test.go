@@ -645,3 +645,67 @@ func TestPushReadsUseRowIDSeekAfterStaleStats(t *testing.T) {
 		t.Fatalf("push read after refresh: %d ops, last %d, err %v", len(ops), last, err)
 	}
 }
+
+// The stale-statistics check runs inside GC transactions and on the push
+// path, so its rowid span must be two indexed endpoint lookups. A combined
+// MAX(rowid) - MIN(rowid) aggregate is planned as a full table/index scan.
+func TestStatsSpanUsesIndexedEndpointLookups(t *testing.T) {
+	app, _ := newTestNode(t, "nodeA0000000001")
+	for _, table := range gcPhaseTables {
+		var plan []struct {
+			Detail string `db:"detail"`
+		}
+		if err := app.NonconcurrentDB().NewQuery("EXPLAIN QUERY PLAN " + rowidSpanSQL(table)).All(&plan); err != nil {
+			t.Fatalf("%s: %v", table, err)
+		}
+		searches := 0
+		for _, row := range plan {
+			if strings.Contains(row.Detail, "SEARCH "+table) {
+				searches++
+			}
+			if strings.Contains(row.Detail, "SCAN ") && !strings.Contains(row.Detail, "SCAN CONSTANT ROW") {
+				t.Fatalf("%s rowid span is not bounded: %s", table, row.Detail)
+			}
+		}
+		if searches != 2 {
+			t.Fatalf("%s rowid span: want 2 endpoint searches, got plan %+v", table, plan)
+		}
+	}
+}
+
+func TestStatsSpanEmptyAndSparseRowIDs(t *testing.T) {
+	app, _ := newTestNode(t, "nodeA0000000001")
+	db := app.NonconcurrentDB()
+	if _, err := db.NewQuery("CREATE TABLE _zz_span (x TEXT)").Execute(); err != nil {
+		t.Fatal(err)
+	}
+	span := func() int64 {
+		t.Helper()
+		n, err := rowidSpan(db, "_zz_span")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := span(); n != 0 {
+		t.Fatalf("empty table span = %d, want 0", n)
+	}
+	if _, err := db.NewQuery("INSERT INTO _zz_span (rowid, x) VALUES (7, 'a')").Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if n := span(); n != 1 {
+		t.Fatalf("single-row span = %d, want 1", n)
+	}
+	if _, err := db.NewQuery("INSERT INTO _zz_span (rowid, x) VALUES (100, 'b'), (5000, 'c')").Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if n := span(); n != 4994 {
+		t.Fatalf("sparse span = %d, want 4994 (rowids 7..5000)", n)
+	}
+	if _, err := db.NewQuery("DELETE FROM _zz_span").Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if n := span(); n != 0 {
+		t.Fatalf("emptied table span = %d, want 0", n)
+	}
+}
