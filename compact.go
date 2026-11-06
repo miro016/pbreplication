@@ -248,11 +248,27 @@ func statsStale(db dbx.Builder, table string) (bool, error) {
 	}
 	var estimated int64
 	fmt.Sscanf(stat, "%d", &estimated)
-	var span int64
-	if err := db.NewQuery("SELECT COALESCE(MAX(rowid) - MIN(rowid) + 1, 0) FROM " + table).Row(&span); err != nil {
+	span, err := rowidSpan(db, table)
+	if err != nil {
 		return false, err
 	}
 	return span >= staleStatsMinRows && span >= staleStatsFactor*estimated, nil
+}
+
+// rowidSpanSQL returns the query for table's rowid span (0 when empty). Each
+// endpoint is its own scalar subquery: SQLite's min/max optimization seeks
+// one end of the rowid b-tree only for a lone MIN() or MAX() aggregate, and
+// plans the combined MAX(rowid) - MIN(rowid) as a full table or index scan.
+func rowidSpanSQL(table string) string {
+	return "SELECT COALESCE((SELECT MAX(rowid) FROM " + table + ") - (SELECT MIN(rowid) FROM " + table + ") + 1, 0)"
+}
+
+// rowidSpan returns MAX(rowid) - MIN(rowid) + 1 for table, or 0 when empty,
+// using two indexed endpoint lookups.
+func rowidSpan(db dbx.Builder, table string) (int64, error) {
+	var span int64
+	err := db.NewQuery(rowidSpanSQL(table)).Row(&span)
+	return span, err
 }
 
 // analyzeBounded runs ANALYZE on table with a bounded sample, restoring the
