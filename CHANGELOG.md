@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.1](https://github.com/miro016/pbreplication/compare/v0.8.0...v0.8.1) (2026-11-06)
+
+
+### Bug Fixes
+
+* bound the stale-statistics rowid span check ([b3317ae](https://github.com/miro016/pbreplication/commit/b3317aedd1b141d62f630fe799bffa85739e38e4))
+* bound the stale-statistics rowid span check ([6a2fd3c](https://github.com/miro016/pbreplication/commit/6a2fd3c00953a555ef79320fd31311cc57953cce))
+
 ## [0.8.0](https://github.com/miro016/pbreplication/compare/v0.7.3...v0.8.0) (2026-11-06)
 
 
