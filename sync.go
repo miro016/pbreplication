@@ -103,6 +103,10 @@ func (r *Replicator) ingestOpsCount(ops []*op) (int, error) {
 		if inserted {
 			insertedCount++
 			r.enqueueApply(o)
+		} else if fenced, err := opFenced(db, o); err != nil {
+			return insertedCount, err
+		} else if fenced {
+			r.noteFencedOp(o)
 		}
 	}
 
@@ -129,6 +133,20 @@ func (r *Replicator) ingestOpsCount(ops []*op) (int, error) {
 	}
 	wake(r.pushWake) // relay to peers (gossip)
 	return insertedCount, nil
+}
+
+// noteFencedOp makes GC fence refusals visible. A refused operation targets
+// state with no local LWW row while its HLC is at or behind the GC fence:
+// it may replay state whose tombstone expired, so only an authoritative
+// snapshot may introduce it. Warnings are throttled to one per minute.
+func (r *Replicator) noteFencedOp(o *op) {
+	n := r.stats.fenced.Add(1)
+	if !r.throttleOK("gc:fenced", time.Minute) {
+		return
+	}
+	r.logWarn("refused remote operation behind the GC fence (no local state; older than collected tombstones)",
+		"peer", o.SrcNode, "seq", o.SrcSeq, "hlc", o.HLC, "collection", o.ColName,
+		"record", o.RecordID, "refused_total", n)
 }
 
 // loadVectorEntry reads a single persisted vector entry.
@@ -222,6 +240,7 @@ func (r *Replicator) pushToPeer(p *member, memberList []*member) {
 		cursor = r.initialPushCursor()
 	}
 
+	r.refreshOplogStats()
 	for {
 		ops, last, err := opsAfterRowID(r.app.DB(), cursor, r.cfg.MaxBatch)
 		if err != nil {

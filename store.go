@@ -146,6 +146,16 @@ func createTables(app core.App) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS _repl_oplog_rec_idx ON _repl_oplog (col_id, record_id, hlc)`,
 		`CREATE INDEX IF NOT EXISTS _repl_oplog_created_idx ON _repl_oplog (created)`,
+		// Push cursors are rowids: keep a durable allocation high-water mark
+		// so rowids never get reused after GC removes the highest (or every)
+		// oplog row. The trigger also covers rows inserted by older releases.
+		`INSERT INTO _repl_state (key, value)
+			VALUES ('oplog_rowid', (SELECT COALESCE(MAX(rowid), 0) FROM _repl_oplog))
+			ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))`,
+		`CREATE TRIGGER IF NOT EXISTS _repl_oplog_rowid AFTER INSERT ON _repl_oplog BEGIN
+			INSERT INTO _repl_state (key, value) VALUES ('oplog_rowid', NEW.rowid)
+			ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), NEW.rowid);
+		END`,
 		`CREATE TABLE IF NOT EXISTS _repl_versions (
 			col_id    TEXT NOT NULL,
 			record_id TEXT NOT NULL,
@@ -191,6 +201,8 @@ func createTables(app core.App) error {
 			PRIMARY KEY (ip, method, path)
 		)`,
 		`CREATE INDEX IF NOT EXISTS _repl_client_paths_ip_idx ON _repl_client_paths (ip)`,
+		`CREATE INDEX IF NOT EXISTS _repl_client_paths_gc_idx ON _repl_client_paths (ip, count DESC, method DESC, path DESC)`,
+		`CREATE INDEX IF NOT EXISTS _repl_client_ips_gc_idx ON _repl_client_ips (last_seen DESC, ip DESC)`,
 		`CREATE TABLE IF NOT EXISTS _repl_sync_seen (
 			run_id TEXT NOT NULL,
 			col_id TEXT NOT NULL,
@@ -244,8 +256,13 @@ func incrLocalSeq(db dbx.Builder) (int64, error) {
 // ---------------------------------------------------------------------
 // oplog
 
+// insertOp stores a locally originated operation (capture, orphan repair,
+// rescue replay or identity re-emission). Local operations are never
+// subject to the remote admission fence: a refused local write would either
+// be silently unreplicated or fail with a misleading error. A conflicting
+// (src_node, src_seq) is a sequence collision and is reported as an error.
 func insertOp(db dbx.Builder, o *op) error {
-	inserted, err := insertOpIfAbsent(db, o)
+	inserted, err := insertOpRow(db, o, false)
 	if err != nil {
 		return err
 	}
@@ -255,28 +272,81 @@ func insertOp(db dbx.Builder, o *op) error {
 	return nil
 }
 
-// insertOpIfAbsent stores o and reports whether it was newly inserted.
-// Callers ingesting remote pages use the result to avoid repeatedly
-// scheduling an already-applied operation when peers retry a request.
+// insertOpIfAbsent stores a remote operation and reports whether it was
+// newly inserted. Callers ingesting remote pages use the result to avoid
+// repeatedly scheduling an already-applied operation when peers retry a
+// request. Remote operations pass the GC admission fence: an operation for
+// a record with no local LWW state is refused when its HLC is at or behind
+// the GC fence (stateGCHLC), because the state that would have rejected it
+// may already have been garbage-collected. Use opFenced to tell a refused
+// operation apart from a duplicate.
 func insertOpIfAbsent(db dbx.Builder, o *op) (bool, error) {
+	return insertOpRow(db, o, true)
+}
+
+// opVersionColID returns the _repl_versions col_id that tracks o's LWW state.
+func opVersionColID(o *op) string {
+	if o.Type == opColUpsert || o.Type == opColDelete {
+		return collectionsColID
+	}
+	return o.ColID
+}
+
+func insertOpRow(db dbx.Builder, o *op, fenced bool) (bool, error) {
 	files := ""
 	if len(o.Files) > 0 {
 		b, _ := json.Marshal(o.Files)
 		files = string(b)
 	}
+	fence := ""
+	if fenced {
+		fence = ` WHERE {:ss} <= 0
+			OR EXISTS (SELECT 1 FROM _repl_versions WHERE col_id = {:vcid} AND record_id = {:rid})
+			OR {:hlc} > COALESCE((SELECT value FROM _repl_state WHERE key = 'gc_hlc'), '')`
+	}
+	// Explicit, monotonic rowids: never reuse a rowid a push cursor may
+	// already have passed, even after GC removed the highest rows.
 	result, err := db.NewQuery(`INSERT OR IGNORE INTO _repl_oplog
-		(src_node, src_seq, hlc, op_type, col_id, col_name, record_id, payload, files, created)
-		VALUES ({:sn}, {:ss}, {:hlc}, {:t}, {:cid}, {:cn}, {:rid}, {:p}, {:f}, {:c})`).
+		(rowid, src_node, src_seq, hlc, op_type, col_id, col_name, record_id, payload, files, created)
+		SELECT MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM _repl_state WHERE key = 'oplog_rowid'), 0),
+			(SELECT COALESCE(MAX(rowid), 0) FROM _repl_oplog)) + 1,
+			{:sn}, {:ss}, {:hlc}, {:t}, {:cid}, {:cn}, {:rid}, {:p}, {:f}, {:c}` + fence).
 		Bind(dbx.Params{
 			"sn": o.SrcNode, "ss": o.SrcSeq, "hlc": o.HLC, "t": o.Type,
 			"cid": o.ColID, "cn": o.ColName, "rid": o.RecordID,
-			"p": string(o.Payload), "f": files, "c": nowStr(),
+			"p": string(o.Payload), "f": files, "c": nowStr(), "vcid": opVersionColID(o),
 		}).Execute()
 	if err != nil {
 		return false, err
 	}
 	rows, err := result.RowsAffected()
 	return rows > 0, err
+}
+
+// opFenced reports whether a remote operation that insertOpIfAbsent did not
+// insert was refused by the GC fence (rather than being a duplicate).
+func opFenced(db dbx.Builder, o *op) (bool, error) {
+	var present bool
+	if err := db.NewQuery(`SELECT EXISTS(SELECT 1 FROM _repl_oplog WHERE src_node = {:s} AND src_seq = {:q})`).
+		Bind(dbx.Params{"s": o.SrcNode, "q": o.SrcSeq}).Row(&present); err != nil {
+		return false, err
+	}
+	return !present, nil
+}
+
+// behindGCFence reports whether o targets state with no local LWW row
+// (cur == nil) while its HLC is at or behind the GC fence. Such an
+// operation may be a stale replay of state whose tombstone was collected,
+// so it must not create state; only an authoritative snapshot can.
+func behindGCFence(db dbx.Builder, o *op, cur *versionRow) (bool, error) {
+	if cur != nil {
+		return false, nil
+	}
+	floor, err := getState(db, stateGCHLC)
+	if err != nil {
+		return false, err
+	}
+	return floor != "" && o.HLC <= floor, nil
 }
 
 // opsAfterRowID returns ops with rowid > cursor, ordered by rowid.

@@ -147,6 +147,11 @@ func (r *Replicator) applyRecordBatch(ops []*op) {
 			if !supersedes(o, cur) {
 				continue
 			}
+			if reject, err := gcRejects(db, o, cur); err != nil {
+				return err
+			} else if reject {
+				continue
+			}
 
 			rec, err := txApp.FindRecordById(e.col, o.RecordID)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -276,6 +281,11 @@ func (r *Replicator) applyRecordOp(o *op) error {
 	if !supersedes(o, cur) {
 		return nil
 	}
+	if reject, err := gcRejects(r.app.DB(), o, cur); err != nil {
+		return err
+	} else if reject {
+		return nil
+	}
 
 	col := r.resolveCollection(o)
 	if col == nil {
@@ -302,6 +312,11 @@ func (r *Replicator) applyRecordOp(o *op) error {
 			return err
 		}
 		if !supersedes(o, cur) {
+			return nil
+		}
+		if reject, err := gcRejects(db, o, cur); err != nil {
+			return err
+		} else if reject {
 			return nil
 		}
 
@@ -468,6 +483,11 @@ func (r *Replicator) applyCollectionOp(o *op) error {
 	cur, err := getVersion(r.app.DB(), collectionsColID, o.RecordID)
 	if err != nil {
 		return err
+	}
+	if reject, err := gcRejects(r.app.DB(), o, cur); err != nil {
+		return err
+	} else if reject {
+		return nil
 	}
 
 	existing, err := r.app.FindCollectionByNameOrId(o.ColID)

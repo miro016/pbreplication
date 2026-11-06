@@ -25,10 +25,10 @@ import (
 
 // dbSnapshotManifest describes one prepared database snapshot file.
 type dbSnapshotManifest struct {
-	ID        string           `json:"id"`
-	NodeID    string           `json:"node_id"`
-	SizeBytes int64            `json:"size_bytes"`
-	SHA256    string           `json:"sha256"`
+	ID        string `json:"id"`
+	NodeID    string `json:"node_id"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
 	// Vector is the serving node's contiguous vector INCLUDING its own
 	// local sequence, read BEFORE the vacuum started. Understating is
 	// safe: ops the snapshot already contains replay as LWW no-ops.

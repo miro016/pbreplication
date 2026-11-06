@@ -623,9 +623,7 @@ func TestClientTrackingAndGeoCache(t *testing.T) {
 	}
 
 	// GC keeps fresh rows
-	if err := gcClients(app.NonconcurrentDB(), time.Hour); err != nil {
-		t.Fatal(err)
-	}
+	completeGC(t, r)
 	var n int
 	_ = app.DB().NewQuery(`SELECT COUNT(*) FROM _repl_client_ips`).Row(&n)
 	if n != 2 {

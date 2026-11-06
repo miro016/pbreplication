@@ -840,6 +840,11 @@ func (r *Replicator) serveSnapshotMeta(e *core.RequestEvent) error {
 	}
 
 	horizon := encodeHLC(uint64(time.Now().Add(-r.cfg.TombstoneRetention).UnixMilli()), 0)
+	if floor, err := getState(r.app.DB(), stateGCHLC); err != nil {
+		return e.InternalServerError("failed to read GC horizon", nil)
+	} else if floor > horizon {
+		horizon = floor
+	}
 
 	return e.JSON(http.StatusOK, &snapshotMeta{
 		NodeID:            r.nodeID,
