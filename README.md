@@ -151,7 +151,10 @@ docker compose up --build
 | `DebounceWindow` | `150ms` | Batching window before pushing local writes. |
 | `MaxBatch` | `500` | Max operations per push/pull page. |
 | `TombstoneRetention` | `720h` | How long delete markers are kept. Must exceed your longest planned node downtime — nodes offline for longer are resynced with a full snapshot automatically. |
-| `CompactionInterval` | `1h` | How often the oplog/bookkeeping garbage collection runs. |
+| `CompactionInterval` | `1h` | How often a bounded garbage-collection run starts; also the grace period before superseded operations are dropped. |
+| `CompactionBatchSize` | `200` | Maximum candidate rows examined per GC write transaction. |
+| `CompactionMaxBatches` | `32` | Maximum independently committed batches per GC invocation. |
+| `CompactionTimeBudget` | `1s` | GC run budget, checked between bounded transactions (usually the binding limit). Unfinished passes resume from persisted keyset cursors. |
 | `ExcludeCollections` | `_mfas, _otps, _authOrigins` | Collections that stay node-local. |
 | `ReplicateSuperusers` | `true` | Replicate the `_superusers` collection. |
 | `MigrateBeforeReplication` | `true` | After an optional pre-open physical copy, let PocketBase apply all pending host migrations synchronously before replication workers or logical sync start. |
@@ -179,6 +182,103 @@ docker compose up --build
 The example app maps `PBR_NODE_URL`, `PBR_SEED_URL`,
 `PBR_CLUSTER_SECRET`, `PBR_GEOIP_DB`, `PBR_ENABLE_IPAPI` and
 `PBR_IPAPI_KEY` env vars to these fields.
+
+### Retention and bounded garbage collection
+
+Delete expired application records through PocketBase's normal
+`txApp.DeleteWithContext(ctx, record)` inside the host's retention transaction.
+The replication delete-execute hook atomically captures the delete operation,
+source sequence and LWW tombstone. **Do not raw-delete records or replication
+metadata.** A rollback must roll back both the data deletion and its capture.
+No separate retention-deletion API is needed.
+
+The scheduled collector preserves live LWW versions and the newest necessary
+operations; it does not age-delete live versions. Delete operations and
+version tombstones are collected after `TombstoneRetention`.
+
+**Orphan repair.** Records that were removed locally *without* capture (raw
+SQL deletes from older host code, or deletes while replication capture was
+not running) are converted into fresh local delete tombstones, which then
+replicate and receive the full `TombstoneRetention`. Because a repair is a
+winning cluster-wide delete, it needs positive local evidence that the record
+existed here: a live local LWW version, or a locally originated operation, in
+a collection that still exists under the same id (and is the same
+incarnation). The collector never repairs records whose collection was
+deleted, records applied through collection-name resolution, or remote
+operations that never applied locally (parked, failed or conflicting
+applies). If a record and all of its replication metadata were erased, GC
+cannot reconstruct the deletion; recovery requires an authoritative
+snapshot/reconciliation.
+
+**Explicit invocation.** Applications may call
+`replicator.Compact(ctx) (CompactionStats, error)`. The result reports
+`Batches`, `Scanned`, `Deleted`, `Repaired`, `Flagged` and `Complete`. Each
+invocation stops at its batch/time budget or on cancellation; `Complete`
+means one pass finished. Do not invoke it inside a host write transaction.
+`Compact` returns `ErrCompactionRunning` while another invocation runs and
+`ErrCompactionNotReady` before replication storage is initialized.
+Cancellation rolls back only the current batch. Budgets are checked between
+batches and are not SQLite lock-wait deadlines.
+
+**Passes.** A pass visits five tables (oplog, versions, members, client IPs,
+client paths) with bounded rowid keysets. The small tables are interleaved
+with the oplog, one batch at a time, so a large oplog backlog cannot starve
+membership or client cleanup; the versions phase runs after the oplog phase
+so that one pass can collect a tombstone and its delete. Each phase captures
+a finite upper rowid when it starts, so continued inserts are deferred to the
+next pass instead of extending the current one. Progress is committed with
+every batch; a completed pass clears the cursor. Retained live rows are
+rescanned every pass, so throughput must exceed churn plus that recurring
+scan work for a backlog to shrink. Per-batch and per-run details are logged
+at debug level; one info milestone is logged per completed pass, plus a
+progress line at most every five minutes while a pass is running.
+
+**Upgrade.** Storage initialization adds a rowid high-water mark (state row
+and trigger) and two small client-table indexes. No new oplog index is built:
+all oplog candidate checks use the existing `_repl_oplog_rec_idx`. GC does not
+run `VACUUM`; freed pages remain available for SQLite reuse (or incremental
+vacuum). Push rowids and source sequences never reset when GC removes the
+highest or every oplog row, also across a downgrade/re-upgrade.
+
+**Fences and resync.** When a delete operation expires, its source sequence
+becomes that source's snapshot horizon: a peer that has not yet seen the
+dropped delete receives `snapshot_required` and resyncs. Peers that are only
+lagging behind newer operations keep replicating normally. Collected
+tombstones also advance a scalar HLC fence: a remote operation for a record
+with **no** local LWW state is refused when its HLC is at or behind the
+fence, because the tombstone that would have rejected it may be gone. Such
+refusals are counted and logged as throttled warnings. Existing LWW state is
+never fenced, and logical snapshot rows bypass the fence (they are the
+recovery path). Writes rescued during a full-copy resync that would create
+state behind the copied fence are not replayed, matching what every peer
+would do; they are reported in the replay summary.
+
+**Tuning.** The default hourly cadence suits small deployments. For
+high-volume databases, tunable starting points are:
+
+| Profile | `CompactionInterval` | `CompactionBatchSize` | `CompactionMaxBatches` | `CompactionTimeBudget` |
+| --- | --- | --- | --- | --- |
+| Steady state | `time.Minute` | `200` | `128` | `2*time.Second` |
+| Temporary backlog catch-up | `10*time.Second` | `200` | `256` | `2*time.Second` |
+
+Rows per run are `min(BatchSize × MaxBatches, TimeBudget × per-row rate)`, and
+in practice **the time budget is the binding limit**. The
+`TestCompactionThroughputFixture` fixture (`PBR_GC_BENCH=1`; about
+85,000 oplog rows and 20,000 versions on a warm cache and local NVMe)
+measured about 5,500–7,800 rows/s across runs, i.e. about 10,600–15,800 rows
+per 2-second run, well below the 25,600/51,200 batch caps. At that rate the
+steady profile scans roughly 15–23 million rows/day and the catch-up profile
+roughly 90–135 million rows/day; a cold multi-GiB database will be slower. Treat these as upper bounds, not cleanup ETAs. Tune with committed
+`Scanned` counts over wall time and application write latency; keep batches
+small and add run opportunities before enlarging transactions. Return to the
+steady profile after catch-up.
+
+The collector re-analyzes a table (bounded `ANALYZE` sample) when SQLite's
+planner statistics underestimate it by 10x or more, because stale statistics
+collected while the table was tiny would otherwise turn every keyset batch
+into a full-table scan. The pusher runs the same check on the oplog (at most
+once a minute, on the read pool), so push batches stay rowid seeks on a node
+whose oplog grew quickly after its last `PRAGMA optimize`.
 
 ### Behind a reverse proxy / NAT
 

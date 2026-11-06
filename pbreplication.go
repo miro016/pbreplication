@@ -103,9 +103,21 @@ type Config struct {
 	// Default: 720h (30 days).
 	TombstoneRetention time.Duration
 
-	// CompactionInterval is how often the oplog is compacted.
+	// CompactionInterval is how often a bounded GC run starts. It is also
+	// the grace period before superseded operations may be dropped.
 	// Default: 1h.
 	CompactionInterval time.Duration
+
+	// CompactionBatchSize bounds rows examined per GC write transaction
+	// (default 200).
+	CompactionBatchSize int
+	// CompactionMaxBatches bounds committed GC batches per run (default 32).
+	CompactionMaxBatches int
+	// CompactionTimeBudget bounds a GC run; it is checked between batches,
+	// so a run may overrun it by one batch (default 1s). Unfinished passes
+	// resume from durable keyset cursors on the next run. In practice the
+	// time budget, not CompactionMaxBatches, usually limits a run.
+	CompactionTimeBudget time.Duration
 
 	// ExcludeCollections lists collections that must NOT replicate.
 	// Default: _mfas, _otps, _authOrigins (node-local auth artifacts).
@@ -272,6 +284,15 @@ func (c *Config) setDefaults() {
 	if c.CompactionInterval <= 0 {
 		c.CompactionInterval = time.Hour
 	}
+	if c.CompactionBatchSize <= 0 {
+		c.CompactionBatchSize = 200
+	}
+	if c.CompactionMaxBatches <= 0 {
+		c.CompactionMaxBatches = 32
+	}
+	if c.CompactionTimeBudget <= 0 {
+		c.CompactionTimeBudget = time.Second
+	}
 	if c.ExcludeCollections == nil {
 		c.ExcludeCollections = []string{"_mfas", "_otps", "_authOrigins"}
 	}
@@ -353,8 +374,12 @@ func (c *Config) validateMigrationPolicy() error {
 
 // Replicator is the running replication engine of a node.
 type Replicator struct {
-	app core.App
-	cfg Config
+	app       core.App
+	cfg       Config
+	compactMu sync.Mutex
+	// statsCheckAt throttles the push path's planner-statistics check
+	// (unix nanoseconds of the last check).
+	statsCheckAt atomic.Int64
 
 	clock  *hlc
 	nodeID string
@@ -484,6 +509,7 @@ type Replicator struct {
 		applied   atomic.Int64
 		failed    atomic.Int64
 		blocked   atomic.Int64
+		fenced    atomic.Int64 // remote ops refused by the GC fence
 		lastError atomic.Value // string
 	}
 }
@@ -659,6 +685,9 @@ func (r *Replicator) initStorage(app core.App) error {
 	// resume the clock from the last persisted timestamp
 	if persisted, _ := getState(db, stateHLC); persisted != "" {
 		r.clock.Resume(persisted)
+	}
+	if floor, _ := getState(db, stateGCHLC); floor != "" {
+		r.clock.Resume(floor)
 	}
 
 	// Ensure the self membership row exists, but DON'T overwrite a

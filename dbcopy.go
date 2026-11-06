@@ -540,9 +540,13 @@ func (r *Replicator) replayRescuedOps() {
 		return
 	}
 
-	replayed, skipped := 0, 0
+	replayed, skipped, fenced := 0, 0, 0
 	for _, o := range rescue.Ops {
 		ok, err := r.replayRescuedOp(o)
+		if errors.Is(err, errRescueFenced) {
+			fenced++
+			continue
+		}
 		if err != nil {
 			r.logError("replay rescued op "+o.ColName+"/"+o.RecordID, err, "collection", o.ColName)
 			continue
@@ -557,12 +561,22 @@ func (r *Replicator) replayRescuedOps() {
 	_ = os.Remove(r.rescuePath())
 	if len(rescue.Ops) > 0 {
 		r.logMilestone("re-applied offline writes after full copy",
-			"replayed", replayed, "superseded_by_cluster", skipped)
+			"replayed", replayed, "superseded_by_cluster", skipped, "behind_gc_fence", fenced)
 		r.emitEvent(EventCopyFinished, "offline writes re-applied after full copy",
-			"replayed", replayed, "superseded", skipped)
+			"replayed", replayed, "superseded", skipped, "behind_gc_fence", fenced)
+		if fenced > 0 {
+			r.logWarn("offline writes older than the cluster's collected tombstones were not replayed "+
+				"(every peer would refuse them; restore them from an authoritative source if needed)",
+				"count", fenced)
+		}
 	}
 	wake(r.pushWake)
 }
+
+// errRescueFenced marks a rescued op that creates state behind the copied
+// database's GC fence. Every peer refuses such an operation at ingest, so
+// replaying it locally would leave this node permanently divergent.
+var errRescueFenced = errors.New("rescued operation is behind the GC fence")
 
 // replayRescuedOp applies one rescued op if it still wins LWW, and
 // re-emits it into the oplog under a fresh local sequence number with
@@ -578,6 +592,11 @@ func (r *Replicator) replayRescuedOp(o *op) (bool, error) {
 		}
 		if !supersedes(o, cur) {
 			return false, nil
+		}
+		if behind, err := behindGCFence(r.app.DB(), o, cur); err != nil {
+			return false, err
+		} else if behind {
+			return false, errRescueFenced
 		}
 		if err := r.applyCollectionOp(o); err != nil {
 			return false, err
@@ -601,6 +620,11 @@ func (r *Replicator) replayRescuedOp(o *op) (bool, error) {
 		if !supersedes(o, cur) {
 			return false, nil
 		}
+		if behind, err := behindGCFence(r.app.DB(), o, cur); err != nil {
+			return false, err
+		} else if behind {
+			return false, errRescueFenced
+		}
 		col := r.resolveCollection(o)
 		if col == nil {
 			return false, fmt.Errorf("collection %s not found", o.ColName)
@@ -619,6 +643,11 @@ func (r *Replicator) replayRescuedOp(o *op) (bool, error) {
 			}
 			if !supersedes(o, cur) {
 				return nil
+			}
+			if behind, err := behindGCFence(db, o, cur); err != nil {
+				return err
+			} else if behind {
+				return errRescueFenced
 			}
 
 			switch o.Type {

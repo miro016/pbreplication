@@ -342,30 +342,6 @@ func (r *Replicator) geoStep() bool {
 	return true
 }
 
-// gcClients prunes stale/excess client rows (called from compact).
-func gcClients(db dbx.Builder, retention time.Duration) error {
-	cutoff := time.Now().UTC().Add(-retention).Format(time.RFC3339)
-	if _, err := db.NewQuery(`DELETE FROM _repl_client_ips WHERE last_seen < {:cut}`).
-		Bind(dbx.Params{"cut": cutoff}).Execute(); err != nil {
-		return err
-	}
-	if _, err := db.NewQuery(fmt.Sprintf(`DELETE FROM _repl_client_ips WHERE ip NOT IN (
-		SELECT ip FROM _repl_client_ips ORDER BY last_seen DESC LIMIT %d)`, maxTrackedClients)).Execute(); err != nil {
-		return err
-	}
-
-	// drop paths for IPs no longer tracked, then cap paths per IP
-	if _, err := db.NewQuery(`DELETE FROM _repl_client_paths
-		WHERE ip NOT IN (SELECT ip FROM _repl_client_ips)`).Execute(); err != nil {
-		return err
-	}
-	_, err := db.NewQuery(fmt.Sprintf(`DELETE FROM _repl_client_paths WHERE rowid NOT IN (
-		SELECT rowid FROM _repl_client_paths p
-		WHERE (SELECT COUNT(*) FROM _repl_client_paths q
-			WHERE q.ip = p.ip AND q.count > p.count) < %d)`, maxPathsPerIP)).Execute()
-	return err
-}
-
 // ---------------------------------------------------------------------
 // dashboard endpoints
 
