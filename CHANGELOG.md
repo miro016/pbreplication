@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.0](https://github.com/miro016/pbreplication/compare/v0.7.3...v0.8.0) (2026-11-06)
+
+
+### Features
+
+* bounded, resumable garbage collection with explicit Compact API ([7ec5327](https://github.com/miro016/pbreplication/commit/7ec53277965df04a2c50edba587e56330bb67338))
+* bounded, resumable garbage collection with explicit Compact API ([964fdbd](https://github.com/miro016/pbreplication/commit/964fdbd218812eec5a13acdb54c8df09d3f78df6))
+
 ## [0.7.3](https://github.com/miro016/pbreplication/compare/v0.7.2...v0.7.3) (2026-10-01)
 
 
